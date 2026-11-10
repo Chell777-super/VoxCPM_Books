@@ -1,0 +1,26 @@
+# Зависимости VoxCPM Books (torch ставится отдельно из индекса PyTorch с CUDA).
+# Сам пакет voxcpm ставится через `uv pip install --no-deps -e .` — так мы не тянем
+# тяжёлые и ненужные для озвучки пакеты (funasr, datasets, modelscope, spaces…).
+
+# --- ядро VoxCPM2 (инференс) ---
+transformers>=4.46,<6
+einops
+pydantic>=2
+tqdm
+soundfile
+librosa>=0.10
+safetensors
+huggingface-hub
+numpy
+regex
+inflect
+addict
+simplejson
+sortedcontainers
+
+# --- приложение ---
+gradio>=6,<7
+pymupdf>=1.24
+razdel
+num2words
+imageio-ffmpeg
