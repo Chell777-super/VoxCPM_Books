@@ -11,3 +11,8 @@ models/
 data/
 lora/
 output/
+
+# VoxCPM Books
+projects/
+voices/
+.cache/
