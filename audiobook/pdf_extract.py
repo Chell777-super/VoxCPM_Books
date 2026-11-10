@@ -19,7 +19,7 @@ from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from typing import Iterable, List, Optional
 
-from .book import SUBHEAD_PREFIX, Book, Chapter
+from .book import DEF_MARK, SUBHEAD_PREFIX, Book, Chapter
 
 
 def _pymupdf():
@@ -143,6 +143,7 @@ class Line:
     kind: str = "text"  # text | heading | subheading | scene
     level: int = 0  # для heading: 1 — раздел, 2 — глава, 3 — параграф
     cont: bool = False  # продолжение многострочного заголовка
+    lead_emph: str = ""  # жирное/курсивное начало строки (термин определения)
 
 
 @dataclass
@@ -193,12 +194,19 @@ def _read_lines(doc, page_numbers: Iterable[int]) -> List[Line]:
                 parts = []
                 sizes = Counter()
                 bold_chars = 0
+                lead, lead_open = [], True
                 for s in spans:
                     t = s["text"]
                     is_sup = bool(s.get("flags", 0) & 1) or s["size"] < max_size * 0.75
                     # маркеры сносок: ¹, *, 12 — мелким шрифтом/надстрочно
                     if is_sup and re.fullmatch(r"\s*[\d*†‡]{1,3}\s*", t) and len(spans) > 1:
                         continue
+                    fl, fn = s.get("flags", 0), s.get("font", "").lower()
+                    emph = bool(fl & 16 or fl & 2) or any(k in fn for k in ("bold", "italic", "oblique"))
+                    if lead_open and (emph or not t.strip()):
+                        lead.append(t)
+                    elif t.strip():
+                        lead_open = False
                     parts.append(t)
                     n = len(t.strip())
                     sizes[round(s["size"], 1)] += n
@@ -224,6 +232,7 @@ def _read_lines(doc, page_numbers: Iterable[int]) -> List[Line]:
                         bold=bold_chars / total > 0.6,
                         page_h=ph,
                         page_w=pw,
+                        lead_emph="" if lead_open else re.sub(r"\s+", " ", clean_raw("".join(lead))).strip(),
                     )
                 )
     return _merge_same_baseline(lines)
@@ -521,6 +530,20 @@ def _page_margins(lines: List[Line]):
     return res
 
 
+DEF_REST_RE = re.compile(r"^\s*(\([^)]{1,120}\))?\s*[—–]\s")
+
+
+def _mark_definition(ln: Line) -> str:
+    """«**Бизнес** — деятельность…»: термин выделен жирным/курсивом и за ним (скобки) и тире."""
+    term = ln.lead_emph.rstrip(" —–-:")
+    if not (2 <= len(term) <= 80) or not ln.text.startswith(term) or ln.bold and len(term) > 0.8 * len(ln.text):
+        return ln.text
+    rest = ln.text[len(term):]
+    if DEF_REST_RE.match(rest):
+        return f"{DEF_MARK}{term}{DEF_MARK}{rest}"
+    return ln.text
+
+
 def _build(lines: List[Line], body: float) -> List[tuple]:
     """Возвращает список элементов [вид, текст, уровень]: heading | subheading | par | scene."""
     margins = _page_margins(lines)
@@ -563,7 +586,7 @@ def _build(lines: List[Line], body: float) -> List[tuple]:
                 prev = ln
                 continue
             if new_par(ln):
-                items.append(["par", ln.text, 0])
+                items.append(["par", _mark_definition(ln), 0])
             else:
                 items[-1][1] = join_lines(items[-1][1], ln.text)
         prev = ln

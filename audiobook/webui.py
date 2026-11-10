@@ -22,6 +22,7 @@ from .pdf_extract import ExtractOptions
 from .pipeline import SynthesisJob, export_book, parse_into_project
 from .project import Project, list_projects
 from .segmenter import SegmentOptions, estimate_duration_sec
+from .voices import check_reference, list_voices, load_voice, save_voice
 
 PRESETS = {"Быстро (черновик)": 6, "Баланс (рекомендуется)": 10, "Качество": 16}
 CHAPTER_MODES = {
@@ -31,7 +32,7 @@ CHAPTER_MODES = {
     "Шаблоны «Глава N»": "regex",
     "Не делить на главы": "none",
 }
-VOICE_MODES = ["Клонировать по образцу", "Создать по описанию", "Голос модели по умолчанию"]
+VOICE_MODES = ["Клонирование по образцу (Hi-Fi с текстом образца)", "Создать по описанию", "Голос модели по умолчанию"]
 DESIGN_SAMPLE = (
     "Добрый вечер. Сегодня я расскажу вам историю, которая началась холодным осенним утром, "
     "когда над городом ещё висел густой туман."
@@ -48,6 +49,8 @@ class AppState:
         self.project: Optional[Project] = None
         self.job: Optional[SynthesisJob] = None
         self.messages: list[str] = []
+        self.voices_dir = Path(os.environ.get("VOXBOOKS_VOICES", "voices"))
+        self.voices_dir.mkdir(parents=True, exist_ok=True)
 
     def _log(self, m: str):
         print(m, flush=True)
@@ -126,7 +129,8 @@ def _segments_table(limit: int = 400, only_problems: bool = False):
 
 
 def _settings_from_ui(
-    first_page, last_page, chapter_mode, rm_headers, rm_foot, skip_toc, skip_service, lang, numbers, abbr, target, maxc, minc, titles, merge
+    first_page, last_page, chapter_mode, rm_headers, rm_foot, skip_toc, skip_service, lang, numbers, abbr, target, maxc, minc,
+    titles, merge, mark_defs=True, replacements="",
 ):
     p = _need_project()
     st = p.settings
@@ -139,7 +143,9 @@ def _settings_from_ui(
         skip_toc_pages=bool(skip_toc),
         skip_service_pages=bool(skip_service),
     )
-    st.normalize = NormalizeOptions(lang=lang, numbers_to_words=bool(numbers), expand_abbreviations=bool(abbr))
+    st.normalize = NormalizeOptions(
+        lang=lang, numbers_to_words=bool(numbers), expand_abbreviations=bool(abbr), replacements=replacements or ""
+    )
     maxc = max(int(maxc), int(target) + 20)
     st.segment = SegmentOptions(
         target_chars=int(target),
@@ -147,6 +153,7 @@ def _settings_from_ui(
         min_chars=int(minc),
         read_chapter_titles=bool(titles),
         merge_short_paragraphs=bool(merge),
+        mark_definitions=bool(mark_defs),
     )
 
 
@@ -235,7 +242,18 @@ def on_open(name):
         raise gr.Error("Выберите проект")
     S.project = Project(S.projects_dir / name)
     out = list(_parse_outputs(f"Открыт проект «{name}»."))
-    return out + list(_voice_ui_values())
+    return out + list(_voice_ui_values()) + _parse_ui_values()
+
+
+def _parse_ui_values():
+    st = S.project.settings
+    e, n, g = st.extract, st.normalize, st.segment
+    mode = next((k for k, v in CHAPTER_MODES.items() if v == e.chapter_mode), list(CHAPTER_MODES)[0])
+    return [
+        e.first_page, e.last_page or 0, mode, e.remove_headers, e.remove_footnotes, e.skip_toc_pages,
+        e.skip_service_pages, n.lang, n.numbers_to_words, n.expand_abbreviations, g.target_chars, g.max_chars,
+        g.min_chars, g.read_chapter_titles, g.merge_short_paragraphs, g.mark_definitions, n.replacements,
+    ]
 
 
 def _voice_ui_values():
@@ -332,6 +350,25 @@ def on_design_sample(description, sample_text, cfg, preset, seed):
     sc = SynthConfig(cfg_value=float(cfg), inference_timesteps=PRESETS.get(preset, 10), seed=int(seed) + int(time.time()) % 1000)
     path, res = _synth_preview((sample_text or DESIGN_SAMPLE).strip(), sc)
     return path, f"Образец: {res.seconds:.1f} с. Не понравилось — нажмите ещё раз (каждый раз новый вариант)."
+
+
+def on_ref_change(path):
+    return check_reference(path) if path else ""
+
+
+def on_lib_save(name, audio, transcript, style):
+    if not audio:
+        raise gr.Error("Сначала загрузите образец голоса.")
+    v = save_voice(name, audio, transcript or "", style or "", S.voices_dir)
+    kind = "Hi-Fi (с транскрипцией)" if v.hifi else "без транскрипции — будет обычное клонирование"
+    return f"✅ Голос «{v.name}» сохранён в библиотеку: {kind}.", gr.update(choices=list_voices(S.voices_dir), value=v.name)
+
+
+def on_lib_load(name):
+    if not name:
+        raise gr.Error("Выберите голос из библиотеки.")
+    v = load_voice(name, S.voices_dir)
+    return VOICE_MODES[0], v.audio, v.transcript, v.style, name, f"Голос «{name}» загружен. Нажмите «Сохранить голос в проект»."
 
 
 def on_use_design(sample_path, sample_text):
@@ -463,16 +500,16 @@ def on_mark_ok(idx):
 SPLIT_LEVELS = {"Разделам": 1, "Главам": 2, "Параграфам (§)": 3}
 
 
-def on_export(formats, split_by, marks_by, mp3_br, aac_br, sr, allow_missing, progress=gr.Progress()):
+def on_export(formats, split_by, marks_by, mp3_br, aac_br, sr, folders, allow_missing, progress=gr.Progress()):
     p = _need_project()
     if S.busy:
         raise gr.Error("Дождитесь окончания озвучки или остановите её.")
     fm = []
-    if "MP3 по главам" in formats:
+    if "MP3 (отдельные файлы)" in formats:
         fm.append("mp3")
     if "M4B (одним файлом, с главами)" in formats:
         fm.append("m4b")
-    if "WAV по главам" in formats:
+    if "WAV (отдельные файлы)" in formats:
         fm.append("wav")
     if not fm:
         raise gr.Error("Выберите хотя бы один формат.")
@@ -483,6 +520,7 @@ def on_export(formats, split_by, marks_by, mp3_br, aac_br, sr, allow_missing, pr
         sample_rate=int(sr),
         split_level=SPLIT_LEVELS.get(split_by, 2),
         marker_level=SPLIT_LEVELS.get(marks_by, 3),
+        folders=bool(folders),
     )
     p.save()
     logs = []
@@ -528,6 +566,14 @@ def build_ui() -> gr.Blocks:
                         minc = gr.Slider(10, 120, value=50, step=5, label="Минимальная длина (короткие реплики объединяются)")
                         titles = gr.Checkbox(label="Читать названия глав", value=True)
                         merge = gr.Checkbox(label="Объединять короткие абзацы-реплики", value=True)
+                        mark_defs = gr.Checkbox(
+                            label="Определения «**Термин** — текст»: пауза после термина", value=True
+                        )
+                        replacements = gr.Textbox(
+                            label="Словарь замен (строка «что=на что»)",
+                            lines=4,
+                            placeholder="ГК РФ=Гражданский кодекс Российской Федерации\nНК РФ=Налоговый кодекс Российской Федерации",
+                        )
                     create_btn = gr.Button("📥 Создать проект и разобрать", variant="primary")
                     with gr.Row():
                         reparse_btn = gr.Button("♻ Перераспределить сегменты")
@@ -543,7 +589,7 @@ def build_ui() -> gr.Blocks:
             with gr.Accordion("Сегменты (первые 400)", open=False):
                 segs_df = gr.Dataframe(headers=["#", "Гл.", "", "Симв.", "Текст", "Заметка"], value=_segments_table(), interactive=False, wrap=True)
 
-        parse_settings = [first_page, last_page, chapter_mode, rm_headers, rm_foot, skip_toc, skip_service, lang, numbers, abbr, target, maxc, minc, titles, merge]
+        parse_settings = [first_page, last_page, chapter_mode, rm_headers, rm_foot, skip_toc, skip_service, lang, numbers, abbr, target, maxc, minc, titles, merge, mark_defs, replacements]
         parse_out = [parse_msg, chapters_df, segs_df, book_text, status_md, proj_dd]
 
         # ------------------------------------------------------------ Голос
@@ -552,11 +598,23 @@ def build_ui() -> gr.Blocks:
             with gr.Row():
                 with gr.Column():
                     gr.Markdown(
-                        "**Клонирование.** Образец 10–20 с чистой речи без музыки. "
-                        "Если указать точный текст образца — похожесть максимальная (режим продолжения)."
+                        "**Клонирование.** Образец 5–30 с (лучше 10–20 с) чистой речи без музыки и эха. "
+                        "**Hi-Fi:** впишите *точный* текст образца — модель продолжит речь из образца "
+                        "(reference + prompt + transcript), похожесть максимальная; инструкция стиля тогда игнорируется."
                     )
+                    with gr.Row():
+                        lib_dd = gr.Dropdown(label="📚 Библиотека голосов", choices=list_voices(S.voices_dir), scale=3)
+                        lib_load_btn = gr.Button("Взять", scale=1)
+                        lib_refresh_btn = gr.Button("🔄", scale=0, min_width=50)
                     ref_audio = gr.Audio(label="Образец голоса", type="filepath", sources=["upload", "microphone"])
-                    ref_text = gr.Textbox(label="Точный текст образца (необязательно, но рекомендуется)", lines=2)
+                    ref_info = gr.Markdown()
+                    ref_text = gr.Textbox(
+                        label="Точный текст образца → Hi-Fi клонирование (дословно, со знаками препинания)", lines=3
+                    )
+                    with gr.Row():
+                        lib_name = gr.Textbox(label="Имя голоса", placeholder="Например: Диктор_мужской", scale=3)
+                        lib_save_btn = gr.Button("💾 В библиотеку", scale=1)
+                    lib_msg = gr.Markdown()
                     denoise = gr.Checkbox(label="Шумоподавление образца (ZipEnhancer, нужен modelscope)", value=False)
                     style = gr.Textbox(
                         label="Инструкция стиля (не работает вместе с текстом образца)",
@@ -577,6 +635,7 @@ def build_ui() -> gr.Blocks:
                 preset = gr.Radio(label="Качество / скорость", choices=list(PRESETS), value="Баланс (рекомендуется)")
                 cfg = gr.Slider(1.0, 3.5, value=2.0, step=0.1, label="CFG (выразительность ↔ стабильность)")
                 seed = gr.Number(label="Seed", value=42, precision=0)
+            gr.Markdown("CFG: если на длинной книге появляется шум/«жужжание» или ускорение — уменьшите до 1.5–1.6.")
             save_voice_btn = gr.Button("💾 Сохранить голос в проект", variant="primary")
             voice_msg = gr.Markdown()
             with gr.Row():
@@ -613,18 +672,21 @@ def build_ui() -> gr.Blocks:
         with gr.Tab("4 · Сборка"):
             formats = gr.CheckboxGroup(
                 label="Форматы",
-                choices=["MP3 по главам", "M4B (одним файлом, с главами)", "WAV по главам"],
-                value=["MP3 по главам", "M4B (одним файлом, с главами)"],
+                choices=["MP3 (отдельные файлы)", "M4B (одним файлом, с главами)", "WAV (отдельные файлы)"],
+                value=["MP3 (отдельные файлы)", "M4B (одним файлом, с главами)"],
             )
             with gr.Row():
-                split_by = gr.Radio(label="Отдельные файлы по", choices=["Разделам", "Главам", "Параграфам (§)"], value="Главам")
+                split_by = gr.Radio(
+                    label="Отдельные файлы по", choices=["Разделам", "Главам", "Параграфам (§)"], value="Параграфам (§)"
+                )
                 marks_by = gr.Radio(
                     label="Метки глав внутри M4B по", choices=["Разделам", "Главам", "Параграфам (§)"], value="Параграфам (§)"
                 )
             with gr.Row():
-                mp3_br = gr.Dropdown(label="Битрейт MP3", choices=["64k", "96k", "128k", "192k"], value="128k")
-                aac_br = gr.Dropdown(label="Битрейт AAC (M4B)", choices=["48k", "64k", "96k", "128k"], value="96k")
+                mp3_br = gr.Dropdown(label="Битрейт MP3", choices=["128k", "192k", "256k", "320k"], value="320k")
+                aac_br = gr.Dropdown(label="Битрейт AAC (M4B)", choices=["96k", "128k", "192k", "256k"], value="256k")
                 out_sr = gr.Dropdown(label="Частота", choices=["48000", "44100", "24000"], value="48000")
+            folders = gr.Checkbox(label="Раскладывать MP3 по папкам: Раздел / Глава / файлы §", value=True)
             allow_missing = gr.Checkbox(label="Собрать, даже если не все сегменты озвучены", value=False)
             export_btn = gr.Button("📦 Собрать аудиокнигу", variant="primary")
             export_files = gr.File(label="Результат", file_count="multiple")
@@ -633,12 +695,16 @@ def build_ui() -> gr.Blocks:
 
         # ----------------------------------------------------------- События
         refresh_btn.click(lambda: gr.update(choices=list_projects(S.projects_dir)), outputs=proj_dd)
-        open_btn.click(on_open, inputs=proj_dd, outputs=parse_out + voice_inputs)
+        open_btn.click(on_open, inputs=proj_dd, outputs=parse_out + voice_inputs + parse_settings)
         create_btn.click(on_create, inputs=[file_in, name_in] + parse_settings, outputs=parse_out)
         reparse_btn.click(on_resegment, inputs=parse_settings, outputs=parse_out)
         reextract_btn.click(on_reextract, inputs=parse_settings, outputs=parse_out)
         apply_text_btn.click(on_apply_text, inputs=[book_text] + parse_settings, outputs=parse_out)
 
+        ref_audio.change(on_ref_change, inputs=ref_audio, outputs=ref_info)
+        lib_save_btn.click(on_lib_save, inputs=[lib_name, ref_audio, ref_text, style], outputs=[lib_msg, lib_dd])
+        lib_load_btn.click(on_lib_load, inputs=lib_dd, outputs=[voice_mode, ref_audio, ref_text, style, lib_name, lib_msg])
+        lib_refresh_btn.click(lambda: gr.update(choices=list_voices(S.voices_dir)), outputs=lib_dd)
         save_voice_btn.click(on_save_voice, inputs=voice_inputs, outputs=[voice_msg, status_md])
         test_btn.click(on_test_voice, inputs=[test_text] + voice_inputs, outputs=[test_audio, test_msg])
         design_btn.click(on_design_sample, inputs=[design_desc, design_text, cfg, preset, seed], outputs=[design_audio, design_msg])
@@ -655,7 +721,7 @@ def build_ui() -> gr.Blocks:
         save_seg_btn.click(on_save_segment_text, inputs=[seg_idx, seg_text], outputs=[job_msg, segs_df])
         problems_btn.click(lambda: _segments_table(limit=1000, only_problems=True), outputs=problems_df)
 
-        export_btn.click(on_export, inputs=[formats, split_by, marks_by, mp3_br, aac_br, out_sr, allow_missing], outputs=[export_files, export_log, export_msg])
+        export_btn.click(on_export, inputs=[formats, split_by, marks_by, mp3_br, aac_br, out_sr, folders, allow_missing], outputs=[export_files, export_log, export_msg])
 
         # При запуске открываем последний проект (если есть)
         def _autoload(name):
@@ -664,9 +730,9 @@ def build_ui() -> gr.Blocks:
                     return on_open(name)
                 except Exception:
                     pass
-            return [gr.update()] * (len(parse_out) + len(voice_inputs))
+            return [gr.update()] * (len(parse_out) + len(voice_inputs) + len(parse_settings))
 
-        demo.load(_autoload, inputs=proj_dd, outputs=parse_out + voice_inputs)
+        demo.load(_autoload, inputs=proj_dd, outputs=parse_out + voice_inputs + parse_settings)
 
         timer = gr.Timer(2.0)
         timer.tick(on_tick, outputs=[progress_html, log_box, status_md])
@@ -691,6 +757,6 @@ def launch(
         server_port=port,
         share=share,
         inbrowser=True,
-        allowed_paths=[str(S.projects_dir.resolve()), tempfile.gettempdir()],
+        allowed_paths=[str(S.projects_dir.resolve()), str(S.voices_dir.resolve()), tempfile.gettempdir()],
         theme=gr.themes.Soft(),
     )

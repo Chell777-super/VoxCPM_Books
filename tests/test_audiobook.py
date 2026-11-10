@@ -366,6 +366,18 @@ def _make_textbook_pdf(path):
             y = text(pg, y, ln, x=L + (12 if k == 0 else 0))
         return y
 
+    def definition(pg, y, term, rest):
+        """Термин жирным, остальное обычным — как в глоссарии учебника."""
+        x = L + 12
+        pg.insert_text((x, y), term, fontsize=9.5, fontname="B")
+        x += pymupdf.Font(fontfile=FONT_BOLD).text_length(term + " ", fontsize=9.5)
+        lines = _wrap(rest, 50)
+        pg.insert_text((x, y), lines[0], fontsize=9.5, fontname="F")
+        y += lh
+        for ln in _wrap(" ".join(lines[1:]), 62) if len(lines) > 1 else []:
+            y = text(pg, y, ln)
+        return y
+
     # 1. выходные данные
     p = page()
     text(p, 80, "УДК 351.824.1  ББК 67.404.91  ISBN 978-5-00156-")
@@ -390,7 +402,13 @@ def _make_textbook_pdf(path):
     y = text(p, y, "Глава 1. Предпринимательство", size=10.5, bold=True, center=True)
     y = text(p, y, "и предпринимательское право", size=10.5, bold=True, center=True) + 12
     y = text(p, y, "Основные понятия", bold=True, center=True) + 4
-    y = para(p, y, "Предприниматель — лицо, осуществляющее предпринимательскую деятельность.")
+    y = definition(p, y, "Бизнес —", "деятельность, осуществляемая субъектами предпринимательства по извлечению благ.")
+    y = definition(
+        p, y, "Коммерческая деятельность", "(лат. commercium — торговля) — вид предпринимательской деятельности."
+    )
+    y = text(p, y + 10, "Основные нормативные акты", bold=True, center=True) + 4
+    y = para(p, y, "Конституция РФ.")
+    y = para(p, y, "Бюджетный кодекс РФ.")
     # 4. колонтитул «20  Раздел I. Общие положения» + § 1 (две строки) + сноска
     p = page("20                                   Раздел I. Общие положения")
     y = text(p, 60, "§ 1. Понятие предпринимательства", bold=True, center=True)
@@ -433,8 +451,12 @@ def test_textbook_hierarchy(textbook_pdf):
     assert "ISBN" not in all_text and "....." not in all_text
     assert "Раздел I. Общие положения" not in all_text  # колонтитулы
     assert "Гинс" not in all_text  # сноска
-    # подзаголовок внутри главы
-    assert book.chapters[1].paragraphs[0] == "#### Основные понятия"
+    # подзаголовок внутри главы и определения с жирным термином
+    paras = book.chapters[1].paragraphs
+    assert paras[0] == "#### Основные понятия"
+    assert paras[1].startswith("**Бизнес** — деятельность")
+    assert paras[2].startswith("**Коммерческая деятельность** (лат. commercium — торговля) — вид")
+    assert "#### Основные нормативные акты" in paras
     # «Глава 1 этого учебника …» в тексте — не заголовок; абзац склеен через страницу
     assert any("в системе современного российского права" in p for p in book.chapters[2].paragraphs)
 
@@ -459,7 +481,73 @@ def test_file_groups_and_m4b_markers(tmp_path, textbook_pdf):
     ]
     # раздел «приклеен» к первой главе
     assert proj.file_groups(2)[0][1] == [0, 1, 2]
-    assert len(proj.file_groups(3)) == 3  # § 1 главы 1 — отдельный файл
+    assert len(proj.file_groups(3)) == 3  # глава 1 (с глоссарием), § 1 главы 1, глава 2 + § 1
     assert len(proj.file_groups(1)) == 1
     # подзаголовок «Основные понятия» — отдельный сегмент-заголовок
-    assert any(s.kind == "heading" and s.text == "Основные понятия." for s in proj.segments)
+    segs = proj.segments
+    assert any(s.kind == "heading" and s.text == "Основные понятия." for s in segs)
+    # определение: точка после термина, пауза после — «определительная»
+    d = next(s for s in segs if s.text.startswith("Бизнес."))
+    assert d.text.startswith("Бизнес. Деятельность, осуществляемая")
+    assert d.pause_ms == 700
+    c = next(s for s in segs if s.text.startswith("Коммерческая деятельность"))
+    assert c.text.startswith("Коммерческая деятельность, от латинского commercium, торговля. Вид")
+    # паузы по уровням: перед главой 2 — 2.5 с, после заголовка раздела — 1.5 с
+    g2 = next(i for i, s in enumerate(segs) if s.text.startswith("Глава 2."))
+    assert segs[g2 - 1].pause_ms == 2500
+    assert segs[0].text.startswith("Раздел 1.") and segs[0].pause_ms == 1500
+    p1 = next(i for i, s in enumerate(segs) if s.text.startswith("§ 1.") or s.text.startswith("Параграф 1."))
+    assert segs[p1 - 1].pause_ms >= 1800
+
+
+def test_export_mp3_folders(tmp_path, textbook_pdf):
+    pytest.importorskip("imageio_ffmpeg")
+    import soundfile as sf
+
+    from audiobook.pipeline import export_book, parse_into_project
+    from audiobook.project import Project
+
+    proj = Project.create(tmp_path / "projects", textbook_pdf, name="Учебник")
+    parse_into_project(proj)
+    sr = 48000
+    for s in proj.segments:  # «озвучиваем» тоном
+        n = int(sr * 0.3)
+        sf.write(str(proj.seg_path(s)), (0.1 * np.sin(np.arange(n) / sr * 2 * np.pi * 200)).astype(np.float32), sr)
+    proj.refresh_status()
+    proj.settings.export.formats = ("mp3",)
+    outs = export_book(proj, log=lambda m: None)
+    rel = [os.path.relpath(o, proj.output_dir / "mp3").replace("\\", "/") for o in outs]
+    assert rel[0].startswith("01 Раздел I. Общие положения/01 Глава 1. Предпринимательство")
+    assert rel[1].split("/")[-1].startswith("002 § 1. Понятие предпринимательства")
+    assert rel[2].startswith("01 Раздел I. Общие положения/02 Глава 2.")
+
+
+def test_voice_library(tmp_path):
+    import soundfile as sf
+
+    from audiobook.voices import check_reference, list_voices, load_voice, save_voice
+
+    wav = tmp_path / "v.wav"
+    sf.write(str(wav), (0.1 * np.sin(np.arange(16000 * 8) / 16000 * 2 * np.pi * 150)).astype(np.float32), 16000)
+    v = save_voice("Диктор", str(wav), "Точный текст образца.", voices_dir=tmp_path / "voices")
+    assert v.hifi and list_voices(tmp_path / "voices") == ["Диктор"]
+    v2 = load_voice("Диктор", tmp_path / "voices")
+    assert v2.transcript == "Точный текст образца." and os.path.exists(v2.audio)
+    assert "8.0 с" in check_reference(v2.audio)
+
+
+@pytest.mark.parametrize(
+    "src,expected",
+    [
+        ("Как указано в ст. 34 Конституции РФ.", "Как указано в статье 34 Конституции РФ."),
+        ("Согласно ч. 1 ст. 2 ГК РФ.", "Согласно части 1 статьи 2 ГК РФ."),
+        ("См. п. 2 ст. 23 ГК РФ.", "Смотри пункт 2 статьи 23 ГК РФ."),
+    ],
+)
+def test_legal_abbreviations(src, expected):
+    assert normalize_text(src) == expected
+
+
+def test_user_replacements():
+    t = normalize_text("Нормы ГК РФ.", NormalizeOptions(replacements="ГК РФ=Гражданского кодекса"))
+    assert t == "Нормы Гражданского кодекса."

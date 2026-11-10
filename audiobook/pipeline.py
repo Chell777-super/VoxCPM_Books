@@ -288,11 +288,20 @@ def export_book(
     all_markers: List[tuple] = []
     offset = 0.0
     parent = ""  # «Глава 2» — префикс для меток параграфов, чтобы «§ 1» разных глав различались
+    hierarchical = len(set(levels)) > 1
+    # Папки: mp3/01 Раздел …/02 Глава …/003 § ….mp3 (уровни выше split_level)
+    folder = {1: None, 2: None}  # текущие папки раздела и главы
+    counters = {1: 0, 2: 0, 3: 0}
     for gi, (name, cis) in enumerate(groups):
         items = []
         for ci in cis:
             lvl = levels[ci] if ci < len(levels) else 2
             name_ci = project.chapter_titles[ci]
+            if hierarchical and lvl in (1, 2) and lvl < opts.split_level:
+                counters[lvl] += 1
+                folder[lvl] = f"{counters[lvl]:02d} {safe_filename(name_ci, 40)}"
+                if lvl == 1:
+                    folder[2], counters[2] = None, 0
             if lvl == 2:
                 parent = re.split(r"[.:]", name_ci, maxsplit=1)[0].strip()[:20]
             # метка: начало каждой главы уровня <= marker_level (и самой группы)
@@ -317,8 +326,13 @@ def export_book(
         log(f"{len(chapter_wavs):03d}. {name} — {fmt_duration(dur)}")
         if "mp3" in opts.formats:
             mp3_dir = out_dir / "mp3"
-            mp3_dir.mkdir(exist_ok=True)
-            mp3 = mp3_dir / f"{len(chapter_wavs):03d} - {safe_filename(name, 50)}.mp3"
+            if opts.folders and hierarchical:
+                for lvl in (1, 2):
+                    if folder[lvl] and lvl < opts.split_level:
+                        mp3_dir = mp3_dir / folder[lvl]
+            mp3_dir.mkdir(parents=True, exist_ok=True)
+            # сквозной номер в имени — чтобы плеер играл по порядку даже без папок
+            mp3 = mp3_dir / f"{len(chapter_wavs):03d} {safe_filename(name, 60)}.mp3"
             encode_mp3(str(wav), str(mp3), opts, title=name, album=title, artist=artist, track=len(chapter_wavs), cover=cover)
             outputs.append(str(mp3))
 

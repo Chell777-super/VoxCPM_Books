@@ -69,6 +69,15 @@ def _apply_voice_args(proj: Project, a) -> bool:
     """Возвращает True, если голос изменился."""
     v = proj.settings.voice
     before = (v.mode, v.reference_wav, v.prompt_text, v.style)
+    if getattr(a, "voice", None):  # голос из библиотеки
+        from .voices import load_voice
+
+        ve = load_voice(a.voice, a.voices_dir)
+        a.ref = ve.audio
+        if getattr(a, "ref_text", None) is None:
+            a.ref_text = ve.transcript
+        if getattr(a, "style", None) is None and ve.style:
+            a.style = ve.style
     if getattr(a, "ref", None):
         proj.voice_dir.mkdir(parents=True, exist_ok=True)
         dst = proj.voice_dir / ("reference" + Path(a.ref).suffix.lower())
@@ -185,6 +194,25 @@ def cmd_status(a):
             print(f"  #{s.idx} [{s.status}] {s.note}: {s.text[:80]}")
 
 
+def cmd_voice_add(a):
+    from .voices import check_reference, save_voice
+
+    text = a.text
+    if a.text_file:
+        text = Path(a.text_file).read_text(encoding="utf-8").strip()
+    v = save_voice(a.name, a.audio, text or "", a.style or "", a.voices_dir)
+    print(check_reference(v.audio))
+    print(f"Голос «{v.name}» сохранён ({'Hi-Fi' if v.hifi else 'без транскрипции'}): {Path(v.audio).parent}")
+
+
+def cmd_voices(a):
+    from .voices import list_voices, load_voice
+
+    for n in list_voices(a.voices_dir):
+        v = load_voice(n, a.voices_dir)
+        print(f"{n:30s} {'Hi-Fi' if v.hifi else '     '}  {v.transcript[:60]}")
+
+
 def cmd_ui(a):
     from .webui import launch
 
@@ -194,6 +222,7 @@ def cmd_ui(a):
 def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(prog="audiobook", description="VoxCPM Books — аудиокниги из PDF")
     ap.add_argument("--projects-dir", default=DEFAULT_PROJECTS)
+    ap.add_argument("--voices-dir", default=os.environ.get("VOXBOOKS_VOICES", "voices"))
     ap.add_argument("--model", default=DEFAULT_MODEL, help="папка модели VoxCPM2 или HF id")
     ap.add_argument("--no-compile", action="store_true", help="не использовать torch.compile")
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -208,6 +237,7 @@ def build_parser() -> argparse.ArgumentParser:
         p.add_argument("--lang", choices=["ru", "en"])
 
     def voice_opts(p):
+        p.add_argument("--voice", help="голос из библиотеки (см. команду voices)")
         p.add_argument("--ref", help="образец голоса (wav/mp3/flac), 10–20 с")
         p.add_argument("--ref-text", help="точный текст образца → максимальная похожесть")
         p.add_argument("--style", help="инструкция стиля, напр. «спокойно, размеренно»")
@@ -257,6 +287,17 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("status", help="состояние проекта")
     p.add_argument("project")
     p.set_defaults(func=cmd_status)
+
+    p = sub.add_parser("voice-add", help="добавить голос в библиотеку (образец + точный текст = Hi-Fi)")
+    p.add_argument("name")
+    p.add_argument("--audio", required=True)
+    p.add_argument("--text", help="точный текст образца")
+    p.add_argument("--text-file", help="файл с точным текстом образца (UTF-8)")
+    p.add_argument("--style")
+    p.set_defaults(func=cmd_voice_add)
+
+    p = sub.add_parser("voices", help="список голосов библиотеки")
+    p.set_defaults(func=cmd_voices)
 
     p = sub.add_parser("ui", help="веб-интерфейс")
     p.add_argument("--host", default="127.0.0.1")

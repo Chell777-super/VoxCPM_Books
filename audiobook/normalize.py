@@ -43,10 +43,34 @@ _RU_ABBR = [
     (r"\bакад\.", "академик"),
     (r"\bул\.", "улица"),
     (r"\bд\.\s?(?=\d)", "дом "),
+    (r"\b(в|во|по|согласно)\s+([чп])\.\s?(\d+)\s+ст\.\s?(?=\d)", None),
+    (r"\b([чп])\.\s?(\d+)\s+ст\.\s?(?=\d)", None),
+    (r"\b(в|во)\s+ст\.\s?(?=\d)", r"\1 статье "),
+    (r"\b(по|согласно)\s+ст\.\s?(?=\d)", r"\1 статье "),
+    (r"\bст\.\s?(?=\d)", "статья "),
+    (r"\b(в|во)\s+ч\.\s?(?=\d)", r"\1 части "),
+    (r"\bч\.\s?(?=\d)", "часть "),
+    (r"\b(в|во)\s+п\.\s?(?=\d)", r"\1 пункте "),
+    (r"\bподп\.\s?(?=\d)", "подпункт "),
+    (r"\bп\.\s?(?=\d)", "пункт "),
     (r"№\s?", "номер "),
     (r"§\s?", "параграф "),
 ]
-_RU_ABBR = [(re.compile(p, re.IGNORECASE), r) for p, r in _RU_ABBR]
+def _part_of_article(m) -> str:
+    """«ч. 1 ст. 2» → «часть 1 статьи 2»; «согласно ч. 1 ст. 2» → «согласно части 1 статьи 2»."""
+    g = m.groups()
+    if len(g) == 3:
+        prep, kind, num = g[0], g[1].lower(), g[2]
+        if kind == "ч":
+            word = "части"
+        else:
+            word = "пункте" if prep.lower() in ("в", "во") else "пункту"
+        return f"{prep} {word} {num} статьи "
+    kind, num = g[0].lower(), g[1]
+    return f"{'часть' if kind == 'ч' else 'пункт'} {num} статьи "
+
+
+_RU_ABBR = [(re.compile(p, re.IGNORECASE), r if r is not None else _part_of_article) for p, r in _RU_ABBR]
 
 # Единицы после числа. Точку сохраняем, только если это похоже на конец предложения.
 _RU_UNITS = {
@@ -90,7 +114,7 @@ _CAN_END_SENTENCE = {
 def _abbr_repl(m, rep: str) -> str:
     """Замена сокращения с сохранением заглавной буквы и точки конца предложения."""
     src = m.group(0)
-    out = rep
+    out = m.expand(rep) if "\\" in rep else rep
     if src[:1].isupper() and out[:1].islower():
         out = out[:1].upper() + out[1:]
     if src.rstrip().endswith(".") and rep in _CAN_END_SENTENCE and _sentence_end_follows(m):
@@ -157,6 +181,19 @@ class NormalizeOptions:
     numbers_to_words: bool = False  # VoxCPM2 обычно сам хорошо читает числа
     remove_footnote_refs: bool = True
     fix_caps: bool = True
+    # Пользовательский словарь: строки «что=на что» (регистр учитывается), например «ГК РФ=Гражданский кодекс»
+    replacements: str = ""
+
+
+def _user_replacements(text: str, table: str) -> str:
+    for line in (table or "").splitlines():
+        if "=" not in line or line.strip().startswith("#"):
+            continue
+        src, dst = line.split("=", 1)
+        src = src.strip()
+        if src:
+            text = re.sub(r"(?<!\w)" + re.escape(src) + r"(?!\w)", dst.strip(), text)
+    return text
 
 
 _URL_RE = re.compile(r"(?:https?://|www\.)\S+|\b[\w.+-]+@[\w-]+\.[\w.]+\b", re.I)
@@ -169,6 +206,8 @@ def _fix_caps(text: str) -> str:
     """«ГЛАВА ПЕРВАЯ. ВСТРЕЧА» → «Глава первая. Встреча». Аббревиатуры (СССР, НАТО) не трогаем."""
 
     def repl(m):
+        if m.re is _CAPS_RUN_RE and sum(len(w) >= 4 for w in re.findall(r"[A-ZА-ЯЁ]+", m.group(0))) < 2:
+            return m.group(0)  # «ГК РФ», «ЦБ РФ» — аббревиатуры
         s = m.group(0).lower()
         before = text[: m.start()].rstrip(" «\"—–-")
         if not before or before[-1] in ".!?…:":
@@ -216,7 +255,7 @@ def _numbers_to_words(text: str, lang: str) -> str:
 
 def normalize_text(text: str, opts: NormalizeOptions | None = None) -> str:
     opts = opts or NormalizeOptions()
-    t = text
+    t = _user_replacements(text, opts.replacements)
 
     t = _URL_RE.sub(" ", t)
     if opts.remove_footnote_refs:
@@ -238,7 +277,7 @@ def normalize_text(text: str, opts: NormalizeOptions | None = None) -> str:
             t = _expand_units(t)
         table = _RU_ABBR if opts.lang == "ru" else _EN_ABBR
         for rx, rep in table:
-            t = rx.sub(lambda m, rep=rep: _abbr_repl(m, rep), t)
+            t = rx.sub(rep if callable(rep) else (lambda m, rep=rep: _abbr_repl(m, rep)), t)
         t = _ROMAN_CENTURY_RE.sub(lambda m: str(roman_to_int(m.group(1)) or m.group(1)), t)
 
     t = _brackets_to_dashes(t)

@@ -137,12 +137,13 @@ def _meta_escape(s: str) -> str:
 @dataclass
 class ExportOptions:
     formats: Tuple[str, ...] = ("mp3",)  # mp3 | m4b | wav
-    mp3_bitrate: str = "128k"
-    aac_bitrate: str = "96k"
+    mp3_bitrate: str = "320k"  # максимум для MP3
+    aac_bitrate: str = "256k"
     sample_rate: int = 48000  # 48000 (оригинал) / 44100 / 24000
     target_db: float = -20.0
-    split_level: int = 2  # файлы по: 1 — разделам, 2 — главам, 3 — параграфам
+    split_level: int = 3  # файлы по: 1 — разделам, 2 — главам, 3 — параграфам
     marker_level: int = 3  # метки глав в M4B до этого уровня
+    folders: bool = True  # MP3 по папкам: Раздел / Глава / файлы §
 
 
 def assemble_chapter(
@@ -190,7 +191,9 @@ def encode_mp3(
     args = ["-i", wav_path]
     if cover and os.path.exists(cover):
         args += ["-i", cover, "-map", "0:a", "-map", "1:v", "-c:v", "mjpeg", "-disposition:v", "attached_pic"]
-    args += ["-c:a", "libmp3lame", "-b:a", opts.mp3_bitrate, "-ar", str(opts.sample_rate), "-ac", "1"]
+    # CBR + -compression_level 0 = LAME -q 0 (самый тщательный кодер, максимальное качество)
+    args += ["-c:a", "libmp3lame", "-b:a", opts.mp3_bitrate, "-compression_level", "0"]
+    args += ["-ar", str(opts.sample_rate), "-ac", "1"]
     args += ["-id3v2_version", "3"]
     for k, v in (("title", title), ("album", album), ("artist", artist), ("genre", "Audiobook")):
         if v:

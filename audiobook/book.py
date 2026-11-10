@@ -14,6 +14,9 @@ SUBHEAD_PREFIX = "#### "
 
 LEVEL_NAMES = {1: "Раздел", 2: "Глава", 3: "§"}
 
+# Термин определения в тексте: «**Бизнес** — деятельность…» (как жирный в Markdown).
+DEF_MARK = "**"
+
 
 @dataclass
 class Chapter:
@@ -145,9 +148,10 @@ class Book:
         return book
 
 
-_SAFE_RE = re.compile(r"[^\w\-. ]+", re.UNICODE)
+_SAFE_RE = re.compile(r"[^\w\-. §,()]+", re.UNICODE)
 
 
 def safe_filename(name: str, max_len: int = 60) -> str:
-    name = _SAFE_RE.sub("", name).strip().replace(" ", "_")
-    return (name[:max_len] or "book").strip("._") or "book"
+    """Имя файла/папки, безопасное для Windows (пробелы и § сохраняются)."""
+    name = re.sub(r"\s+", " ", _SAFE_RE.sub("", name)).strip()
+    return (name[:max_len].rstrip(" .") or "book").strip("._ ") or "book"
