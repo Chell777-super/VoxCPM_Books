@@ -30,7 +30,33 @@
 
 Повторный запуск `install.bat` безопасен: уже установленное пропускается.
 
-Linux: `./install.sh`, затем `./run.sh`.
+## Установка (Ubuntu) — с Nano-vLLM, в разы быстрее
+
+Ubuntu 22.04 / 24.04 (или Ubuntu в WSL2), драйвер NVIDIA ≥ 570.
+
+```bash
+git clone -b claude/pdf-audiobook-app-g9cyae https://github.com/Chell777-super/VoxCPM_Books.git ~/VoxBooks
+cd ~/VoxBooks
+./install.sh          # ~15–30 мин: uv, Python 3.11, PyTorch 2.8 + CUDA 12.8, flash-attn, Nano-vLLM, модель
+./run.sh              # веб-интерфейс http://127.0.0.1:7861
+```
+
+**Почему быстрее.** [Nano-vLLM-VoxCPM](https://github.com/a710128/nanovllm-voxcpm) синтезирует **много фрагментов
+одновременно** (continuous batching), а образец голоса считает один раз (кэш префиксов). Фрагменты книги
+независимы, так что это ровно наш случай. По замерам авторов на RTX 4090 при 16 одновременных запросах
+каждый идёт с RTF ≈ 0.18, т.е. в сумме ≈ 90× быстрее реального времени (обычный PyTorch — ≈ 3×).
+На 3090 ожидаемо в 1.5–2 раза медленнее 4090 — книга на 36 ч аудио ≈ 1–1.5 ч синтеза вместо ~20.
+
+* PyTorch ставится **2.8**: под него есть готовый flash-attn (под более новые — только сборка из исходников на час+).
+* Движок выбирается сам (`auto`): Nano-vLLM, если установлен, иначе обычный. Принудительно: `./run.sh --backend torch`.
+* Параллельность: `./run.sh --concurrency 24` (по умолчанию 16); память GPU: `--gpu-mem 0.85`.
+  Если «CUDA out of memory» — уменьшите `--concurrency` до 8–12 или `--gpu-mem` до 0.75.
+* Смена «Качество / скорость» (число шагов) перезапускает сервер Nano-vLLM (~1 мин).
+* `./install.sh --no-nano` — только обычный движок на последнем PyTorch.
+* PDF → текст: `./pdf2text.sh книга.pdf`.
+* **WSL2** (Ubuntu внутри Windows): драйвер ставится только в Windows, в Ubuntu — нет; проекты лучше держать в
+  домашней папке Linux (`~/VoxBooks`), а не на `/mnt/c` — там диск в разы медленнее. Готовую книгу забрать
+  из Windows: `\\wsl$\Ubuntu\home\<user>\VoxBooks\projects\…\output`.
 
 ## Как пользоваться (веб-интерфейс)
 

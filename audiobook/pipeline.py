@@ -105,7 +105,9 @@ class SynthesisJob:
         self.reseed = reseed
         self.state = JobState()
         self._stop = threading.Event()
-        self._q: "queue.Queue" = queue.Queue(maxsize=8)
+        # большой буфер: в пакетном режиме (Nano-vLLM) результаты приходят пачками, а поток
+        # событий движка нельзя блокировать — иначе встанет видеокарта
+        self._q: "queue.Queue" = queue.Queue(maxsize=512)
         self._ext_log = log
         self.thread: Optional[threading.Thread] = None
 
@@ -181,8 +183,13 @@ class SynthesisJob:
         writer.start()
         try:
             self.log("Загрузка модели…" if self.engine.model is None else "Модель уже загружена.")
-            self.engine.load()
-            self.engine.set_voice(self.project.settings.voice)
+            batch = getattr(self.engine, "batch_capable", False)
+            if batch:
+                self.engine.set_voice(self.project.settings.voice)  # латенты посчитаются при запуске
+                self.engine.load(self.synth.inference_timesteps)
+            else:
+                self.engine.load()
+                self.engine.set_voice(self.project.settings.voice)
             todo = self._todo()
             st.total = len(todo)
             if not todo:
@@ -190,32 +197,63 @@ class SynthesisJob:
             self.log(f"К синтезу: {len(todo)} сегм. ({sum(len(s.text) for s in todo)} симв.)")
 
             cps_hist = [s.cps for s in self.project.segments if s.status == "done" and s.cps > 0 and len(s.text) >= 40]
-            for s in todo:
-                if self._stop.is_set():
-                    self.log("Остановлено пользователем. Прогресс сохранён — можно продолжить позже.")
-                    break
-                st.current = f"#{s.idx}: {s.text[:120]}"
-                expected = statistics.median(cps_hist[-200:]) if len(cps_hist) >= 8 else None
-                try:
-                    res = self.engine.synthesize(s.text, self.synth, seed=self._seed_for(s), expected_cps=expected)
-                except Exception as e:
-                    if "out of memory" in str(e).lower():
-                        self._recover_oom()
-                    s.status, s.note = "error", str(e)[:300]
-                    st.errors += 1
-                    self.log(f"✖ #{s.idx}: {e}")
-                    self.log(traceback.format_exc(limit=2))
-                    continue
-                st.gen_time += res.gen_time
+
+            def expected():
+                return statistics.median(cps_hist[-200:]) if len(cps_hist) >= 8 else None
+
+            def accept(s, res):
                 if res.ok and len(s.text) >= 40:
                     cps_hist.append(res.cps)
                 self._q.put((s, res))
                 st.done += 1
-                if st.done % 10 == 0 or st.done == st.total:
+                if st.done % (50 if batch else 10) == 0 or st.done == st.total:
                     self.log(
-                        f"{st.done}/{st.total} · RTF {st.rtf:.2f} · "
+                        f"{st.done}/{st.total} · RTF {st.rtf:.3f} · "
                         f"аудио {fmt_duration(st.audio_time)} за {fmt_duration(time.time() - st.started)}"
                     )
+
+            def fail(s, e):
+                if "out of memory" in str(e).lower():
+                    self._recover_oom()
+                s.status, s.note = "error", str(e)[:300]
+                st.errors += 1
+                self.log(f"✖ #{s.idx}: {e}")
+
+            if batch:
+                t_start = time.time()
+                self.log(f"Пакетный режим: до {getattr(self.engine.cfg, 'concurrency', '?')} фрагментов одновременно")
+
+                def on_result(s, res, err):
+                    if err is not None:
+                        fail(s, err)
+                        return
+                    st.gen_time = time.time() - t_start  # в пакетном режиме RTF — по общему времени
+                    st.current = f"#{s.idx}: {s.text[:120]}"
+                    accept(s, res)
+
+                self.engine.synthesize_many(
+                    [(s, s.text, self._seed_for(s)) for s in todo],
+                    self.synth,
+                    on_result,
+                    expected_cps=expected,
+                    should_stop=self._stop.is_set,
+                )
+                if self._stop.is_set():
+                    self.log("Остановлено пользователем. Прогресс сохранён — можно продолжить позже.")
+            else:
+                for s in todo:
+                    if self._stop.is_set():
+                        self.log("Остановлено пользователем. Прогресс сохранён — можно продолжить позже.")
+                        break
+                    st.current = f"#{s.idx}: {s.text[:120]}"
+                    try:
+                        res = self.engine.synthesize(s.text, self.synth, seed=self._seed_for(s), expected_cps=expected())
+                    except Exception as e:
+                        fail(s, e)
+                        self.log(traceback.format_exc(limit=2))
+                        continue
+                    st.gen_time += res.gen_time
+                    accept(s, res)
         except Exception as e:
             self.log(f"✖ Критическая ошибка: {e}")
             self.log(traceback.format_exc(limit=4))

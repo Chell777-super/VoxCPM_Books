@@ -42,14 +42,17 @@ DESIGN_DEFAULT = "Мужчина средних лет, тёплый барха�
 
 
 class AppState:
-    def __init__(self, projects_dir: str, model: str, compile_model: bool):
+    def __init__(self, projects_dir: str, model: str = "models/VoxCPM2", compile_model: bool = True, engine_cfg=None):
         self.projects_dir = Path(projects_dir)
         self.projects_dir.mkdir(parents=True, exist_ok=True)
-        self.engine = TTSEngine(EngineConfig(model_path=model, compile=compile_model), log=self._log)
+        self.messages: list[str] = []
+        self.job = None
+        from .engine_nano import make_engine
+
+        cfg = engine_cfg or EngineConfig(model_path=model, compile=compile_model, backend="torch")
+        self.engine = make_engine(cfg, log=self._log)
         self.engine_lock = threading.Lock()
         self.project: Optional[Project] = None
-        self.job: Optional[SynthesisJob] = None
-        self.messages: list[str] = []
         self.voices_dir = Path(os.environ.get("VOXBOOKS_VOICES", "voices"))
         self.voices_dir.mkdir(parents=True, exist_ok=True)
 
@@ -832,9 +835,10 @@ def launch(
     model: str = "models/VoxCPM2",
     projects_dir: str = "projects",
     compile_model: bool = True,
+    engine_cfg=None,
 ):
     global S
-    S = AppState(projects_dir, model, compile_model)
+    S = AppState(projects_dir, model, compile_model, engine_cfg=engine_cfg)
     demo = build_ui()
     demo.queue(default_concurrency_limit=4)
     print(f"Открой в браузере: http://{host}:{port}", flush=True)

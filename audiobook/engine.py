@@ -64,6 +64,9 @@ class EngineConfig:
     compile: bool = True
     low_ram_load: bool = True
     max_length: Optional[int] = None  # размер KV-кэша; None = из конфига модели
+    backend: str = "auto"  # auto | torch | nano (Nano-vLLM: Linux + flash-attn, параллельный синтез)
+    concurrency: int = 16  # Nano-vLLM: сколько фрагментов синтезировать одновременно
+    gpu_memory_utilization: float = 0.85
 
 
 @dataclass
@@ -347,7 +350,6 @@ class TTSEngine:
         self.load()
         seed = sc.seed if seed is None else seed
         full = self._full_text(text)
-        n_chars = max(1, len(text))
         best: Optional[SynthResult] = None
         t_all = time.time()
 
@@ -371,25 +373,12 @@ class TTSEngine:
             )
             wav = wav.squeeze(0).float().cpu().numpy() if isinstance(wav, torch.Tensor) else np.asarray(wav)
             gen_time = time.time() - t0
-            sec = speech_seconds(wav, self.sample_rate)
-            cps = n_chars / max(sec, 0.05)
-            ok = sc.min_cps <= cps <= sc.max_cps
-            note = ""
-            if not ok:
-                note = "слишком медленно/лишнее" if cps < sc.min_cps else "слишком быстро/обрыв"
-            # Если знаем типичную скорость диктора — проверяем отклонение строже
-            if ok and expected_cps and n_chars >= 40:
-                ratio = cps / expected_cps
-                if ratio < 0.55 or ratio > 1.8:
-                    ok, note = False, f"темп ×{ratio:.2f} от среднего"
+            ok, cps, note = evaluate_take(text, wav, self.sample_rate, sc, expected_cps)
             res = SynthResult(wav, self.sample_rate, len(wav) / self.sample_rate, gen_time, attempt, cps, ok, cur_seed, note)
             if ok:
                 best = res
                 break
-            # запоминаем самый правдоподобный из неудачных
-            target = expected_cps or 14.0
-            if best is None or abs(np.log(res.cps / target)) < abs(np.log(best.cps / target)):
-                best = res
+            best = pick_better(best, res, expected_cps)
             self.log(f"  повтор ({attempt}/{sc.max_retries}): {note}, {cps:.1f} симв./с")
         best.attempts = attempt
         best.gen_time = time.time() - t_all
@@ -406,6 +395,35 @@ class TTSEngine:
             return f"{name}: свободно {free / 2**30:.1f} из {total / 2**30:.1f} ГБ"
         except Exception as e:
             return str(e)
+
+
+def evaluate_take(text: str, wav: np.ndarray, sr: int, sc: "SynthConfig", expected_cps: Optional[float]) -> tuple:
+    """Контроль качества дубля по темпу речи: (ok, симв./с, заметка)."""
+    n_chars = max(1, len(text))
+    cps = n_chars / max(speech_seconds(wav, sr), 0.05)
+    ok = sc.min_cps <= cps <= sc.max_cps
+    note = ""
+    if not ok:
+        note = "слишком медленно/лишнее" if cps < sc.min_cps else "слишком быстро/обрыв"
+    # Если знаем типичную скорость диктора — проверяем отклонение строже
+    if ok and expected_cps and n_chars >= 40:
+        ratio = cps / expected_cps
+        if ratio < 0.55 or ratio > 1.8:
+            ok, note = False, f"темп ×{ratio:.2f} от среднего"
+    return ok, cps, note
+
+
+def pick_better(best: Optional["SynthResult"], res: "SynthResult", expected_cps: Optional[float]) -> "SynthResult":
+    """Из неудачных дублей оставляем самый правдоподобный по темпу."""
+    target = expected_cps or 14.0
+    if best is None or abs(np.log(max(res.cps, 0.1) / target)) < abs(np.log(max(best.cps, 0.1) / target)):
+        return res
+    return best
+
+
+def max_patches_for(text: str) -> int:
+    """Предел длины генерации (патчи 6.25/с): с запасом под самый медленный допустимый темп."""
+    return int(len(text) * 1.3 + 40)
 
 
 def speech_seconds(wav: np.ndarray, sr: int, rel_db: float = -40.0) -> float:

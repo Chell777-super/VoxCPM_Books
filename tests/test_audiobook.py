@@ -751,3 +751,102 @@ def test_real_textbook_layout(real_textbook_pdf):
     assert paras[1].startswith("**Бизнес** — деятельность")
     assert paras[2].startswith("**Правовая категория** — понятие, используемое для обозначения")
     assert "#### Основные нормативные акты" in paras
+
+
+# --------------------------------------------------------------------------- #
+# Nano-vLLM: пакетный режим (имитация API сервера)
+# --------------------------------------------------------------------------- #
+
+
+class _FakeNanoPool:
+    def __init__(self):
+        self.active = 0
+        self.max_active = 0
+        self.calls = []
+
+    async def encode_latents(self, wav, fmt):
+        assert fmt == "wav" and len(wav) > 44
+        return np.zeros((8, 64), np.float32).tobytes()
+
+    async def get_model_info(self):
+        return {"sample_rate": 48000, "output_sample_rate": 48000}
+
+    async def stop(self):
+        pass
+
+    async def generate(self, target_text, prompt_latents=None, prompt_text="", ref_audio_latents=None,
+                       max_generate_length=2000, cfg_value=2.0, seed=None, **kw):
+        import asyncio
+
+        self.calls.append(dict(text=target_text, prompt_text=prompt_text, ref=ref_audio_latents is not None,
+                               prompt=prompt_latents is not None, seed=seed))
+        self.active += 1
+        self.max_active = max(self.max_active, self.active)
+        try:
+            sr = 48000
+            # «плохой» дубль для текста со словом ОБРЫВ при первом seed — QC должен перезапросить
+            dur = len(target_text) / 14
+            if "ОБРЫВ" in target_text and seed % 1009 == seed % 1009 and not any(
+                c["text"] == target_text and c["seed"] != seed for c in self.calls[:-1]
+            ):
+                dur = len(target_text) / 60
+            n = int(sr * dur)
+            for k in range(3):
+                await asyncio.sleep(0.01)
+                yield (0.1 * np.sin(np.arange(n // 3) / sr * 2 * np.pi * 200)).astype(np.float32)
+        finally:
+            self.active -= 1
+
+
+def _nano_engine(concurrency=4):
+    from audiobook.engine import EngineConfig
+    from audiobook.engine_nano import NanoEngine
+
+    eng = NanoEngine(EngineConfig(concurrency=concurrency), log=lambda m: None)
+    fake = _FakeNanoPool()
+
+    def load(timesteps=None):
+        if eng.pool is None:
+            eng.pool, eng._timesteps = fake, timesteps or 10
+            if eng.voice is not None:
+                eng._encode_voice(eng.voice)
+        return eng
+
+    eng.load = load
+    return eng, fake
+
+
+def test_nano_engine_batch_and_qc(tmp_path):
+    import soundfile as sf
+
+    from audiobook.engine import SynthConfig, VoiceConfig
+
+    eng, fake = _nano_engine(concurrency=4)
+    ref = tmp_path / "ref.wav"
+    sf.write(str(ref), (0.1 * np.sin(np.arange(16000 * 6) / 16000 * 2 * np.pi * 150)).astype(np.float32), 16000)
+    eng.set_voice(VoiceConfig(mode="clone", reference_wav=str(ref), prompt_text="Точный текст образца."))
+    texts = [f"Это тестовое предложение номер {i}, достаточно длинное для проверки темпа речи." for i in range(12)]
+    texts[5] = "Здесь будет ОБРЫВ речи, потому что модель проглотила половину слов в этой фразе."
+    got = {}
+    eng.synthesize_many([(i, t, 100 + i) for i, t in enumerate(texts)], SynthConfig(max_retries=3),
+                        lambda k, r, e: got.__setitem__(k, (r, e)))
+    assert sorted(got) == list(range(12)) and all(e is None for _, e in got.values())
+    assert 1 < fake.max_active <= 4  # действительно параллельно, но не больше лимита
+    assert got[5][0].attempts == 2 and got[5][0].ok  # повтор после «обрыва»
+    assert all(c["ref"] and c["prompt"] and c["prompt_text"] == "Точный текст образца." for c in fake.calls)
+    assert eng.sample_rate == 48000
+
+
+def test_nano_pipeline_batch(tmp_path, textbook_pdf):
+    from audiobook.pipeline import SynthesisJob, parse_into_project
+    from audiobook.project import Project
+
+    proj = Project.create(tmp_path / "projects", textbook_pdf, name="Учебник")
+    parse_into_project(proj)
+    eng, fake = _nano_engine(concurrency=6)
+    job = SynthesisJob(proj, eng)
+    job.run()
+    assert job.state.done == len(proj.segments) and job.state.errors == 0
+    assert all(s.status == "done" and proj.seg_path(s).exists() for s in proj.segments)
+    assert fake.max_active > 1
+    assert 0 < job.state.rtf < 1

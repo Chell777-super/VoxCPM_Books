@@ -105,6 +105,65 @@ def cmd_torch(channel="latest"):
     sys.exit(1)
 
 
+# Готовые сборки flash-attn (GitHub Dao-AILab) существуют до torch 2.8 — под него и ставим Nano-vLLM.
+NANO_TORCH = ("2.8.0", ["cu128", "cu126"])
+FLASH_ATTN_VER = "2.8.3.post2"
+
+
+def cmd_torch_nano():
+    """PyTorch для Nano-vLLM: версия, под которую есть готовый flash-attn (без многочасовой сборки)."""
+    ver, tags = NANO_TORCH
+    drv = _driver_version()
+    print(f"Драйвер NVIDIA: {drv or 'не найден'}")
+    for tag in tags:
+        if tag == "cu128" and drv is not None and drv < 570:
+            print("  драйвер < 570 — пропускаю CUDA 12.8")
+            continue
+        print(f"\n→ torch=={ver} ({tag}) …")
+        if _pip(f"torch=={ver}", f"torchaudio=={ver}", "--index-url", TORCH_INDEX + tag, "--reinstall-package", "torch") != 0:
+            continue
+        if drv is not None and not _gpu_ok():
+            print(f"  torch {ver} ({tag}) не заработал с видеокартой — пробую следующий")
+            continue
+        print(f"✅ PyTorch {ver} + {tag}")
+        return
+    print("✖ Не удалось установить PyTorch для Nano-vLLM. Обновите драйвер NVIDIA (>= 570) и повторите.")
+    sys.exit(1)
+
+
+def cmd_flash_attn():
+    """Готовый wheel flash-attn под установленные Python/torch/ABI."""
+    import platform
+
+    import torch
+
+    py = f"cp{sys.version_info.major}{sys.version_info.minor}"
+    tv = ".".join(_torch_version().split(".")[:2])
+    cu = "cu" + (torch.version.cuda or "12").split(".")[0]
+    abi = "TRUE" if torch.compiled_with_cxx11_abi() else "FALSE"
+    arch = platform.machine()
+    try:
+        import flash_attn
+
+        print(f"flash-attn {flash_attn.__version__} уже установлен")
+        return
+    except Exception:
+        pass
+    name = f"flash_attn-{FLASH_ATTN_VER}+{cu}torch{tv}cxx11abi{abi}-{py}-{py}-linux_{arch}.whl"
+    url = f"https://github.com/Dao-AILab/flash-attention/releases/download/v{FLASH_ATTN_VER}/{name}"
+    print(f"Скачиваю готовый flash-attn: {name}")
+    if _pip(url) == 0:
+        print("✅ flash-attn установлен")
+        return
+    print(
+        "✖ Готового flash-attn под эту связку нет.\n"
+        "  Вариант: собрать из исходников (30–90 мин, нужен CUDA Toolkit с nvcc):\n"
+        "    MAX_JOBS=4 uv pip install --python .venv/bin/python flash-attn --no-build-isolation\n"
+        "  Или запускать без Nano-vLLM: ./run.sh --backend torch"
+    )
+    sys.exit(1)
+
+
 def cmd_constraints(path):
     import torch
     import torchaudio
@@ -227,6 +286,13 @@ def cmd_check():
         ok = False
         print(f"✖ {e}")
     try:
+        import flash_attn
+        import nanovllm_voxcpm
+
+        print(f"Nano-vLLM {getattr(nanovllm_voxcpm, '__version__', '?')} + flash-attn {flash_attn.__version__} — параллельный синтез доступен")
+    except Exception as e:  # noqa: BLE001
+        print(f"· Nano-vLLM не установлен ({type(e).__name__}) — будет обычный PyTorch-движок")
+    try:
         import imageio_ffmpeg
 
         print(f"ffmpeg: {imageio_ffmpeg.get_ffmpeg_exe()}")
@@ -255,4 +321,4 @@ if __name__ == "__main__":
         print(__doc__)
         sys.exit(1)
     cmd, rest = args[0], args[1:]
-    {"torch": cmd_torch, "constraints": cmd_constraints, "triton": cmd_triton, "download": cmd_download, "check": cmd_check}[cmd](*rest)
+    {"torch": cmd_torch, "torch-nano": cmd_torch_nano, "flash-attn": cmd_flash_attn, "constraints": cmd_constraints, "triton": cmd_triton, "download": cmd_download, "check": cmd_check}[cmd](*rest)

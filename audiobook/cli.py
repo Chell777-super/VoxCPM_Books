@@ -22,7 +22,7 @@ from pathlib import Path
 
 from .audio import fmt_duration
 from .book import Book
-from .engine import EngineConfig, TTSEngine
+from .engine import EngineConfig
 from .pipeline import SynthesisJob, export_book, parse_into_project
 from .project import Project
 
@@ -106,13 +106,26 @@ def _apply_voice_args(proj: Project, a) -> bool:
     return changed
 
 
+def _engine_cfg(a) -> EngineConfig:
+    return EngineConfig(
+        model_path=a.model,
+        compile=not a.no_compile,
+        backend=a.backend,
+        concurrency=a.concurrency,
+        gpu_memory_utilization=a.gpu_mem,
+    )
+
+
 def _run_synth(proj: Project, a) -> None:
     if proj.settings.voice.mode != "clone":
         print(
             "⚠ Образец голоса не задан (--ref). Без образца тембр будет немного меняться между сегментами. "
             "Рекомендуется: --ref voice.wav (10–20 с чистой речи)."
         )
-    engine = TTSEngine(EngineConfig(model_path=a.model, compile=not a.no_compile), log=lambda m: print(m, flush=True))
+    from .engine_nano import make_engine
+
+    log = lambda m: print(m, flush=True)  # noqa: E731
+    engine = make_engine(_engine_cfg(a), log=log)
     indices = None
     redo = False
     if getattr(a, "redo_flagged", False):
@@ -246,7 +259,7 @@ def cmd_pdf2text(a):
 def cmd_ui(a):
     from .webui import launch
 
-    launch(host=a.host, port=a.port, share=a.share, model=a.model, projects_dir=a.projects_dir, compile_model=not a.no_compile)
+    launch(host=a.host, port=a.port, share=a.share, projects_dir=a.projects_dir, engine_cfg=_engine_cfg(a))
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -254,7 +267,17 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--projects-dir", default=DEFAULT_PROJECTS)
     ap.add_argument("--voices-dir", default=os.environ.get("VOXBOOKS_VOICES", "voices"))
     ap.add_argument("--model", default=DEFAULT_MODEL, help="папка модели VoxCPM2 или HF id")
-    ap.add_argument("--no-compile", action="store_true", help="не использовать torch.compile")
+    ap.add_argument("--no-compile", action="store_true", help="не использовать torch.compile / CUDA Graphs")
+    ap.add_argument(
+        "--backend",
+        default=os.environ.get("VOXBOOKS_BACKEND", "auto"),
+        choices=["auto", "nano", "torch"],
+        help="движок: nano — Nano-vLLM (Linux, параллельный синтез), torch — обычный, auto — nano если установлен",
+    )
+    ap.add_argument("--concurrency", type=int, default=int(os.environ.get("VOXBOOKS_CONCURRENCY", "16")),
+                    help="Nano-vLLM: фрагментов одновременно (3090: 12–24)")
+    ap.add_argument("--gpu-mem", type=float, default=float(os.environ.get("VOXBOOKS_GPU_MEM", "0.85")),
+                    help="Nano-vLLM: доля видеопамяти (0.7–0.9)")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     def parse_opts(p):
