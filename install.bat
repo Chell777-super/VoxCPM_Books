@@ -9,10 +9,10 @@ rem  Настройки (можно поменять при необходимо
 rem ============================================================
 rem  Python для окружения (uv скачает его сам)
 set "PY_VER=3.11"
-rem  Версия PyTorch и сборка CUDA. cu126 работает с драйвером NVIDIA >= 560,
-rem  cu128 - с драйвером >= 570. Для RTX 3090 подходят обе.
-set "TORCH_VER=2.10.0"
-set "TORCH_CUDA=cu126"
+rem  PyTorch: latest = самая новая версия с самой новой CUDA, которую поддерживает
+rem  драйвер (CUDA 13.x при драйвере >= 580), с автоматическим откатом на проверенную
+rem  2.10 + CUDA 12.6. stable = сразу проверенная версия.
+set "TORCH_CHANNEL=latest"
 set "VENV=.venv"
 set "MODEL_DIR=models\VoxCPM2"
 
@@ -20,7 +20,7 @@ call "%~dp0installer\env.bat"
 
 echo.
 echo  ==========================================================
-echo     VoxCPM Books - установка  (uv + PyTorch %TORCH_CUDA%)
+echo     VoxCPM Books - установка  (uv + PyTorch %TORCH_CHANNEL%)
 echo  ==========================================================
 echo.
 
@@ -65,13 +65,9 @@ set "PY=%~dp0%VENV%\Scripts\python.exe"
 echo [2/6] Окружение: %PY%
 
 rem ---------------------------------------------------- 4. PyTorch CUDA
-echo [3/6] PyTorch %TORCH_VER% (%TORCH_CUDA%) - около 2.5 ГБ, наберитесь терпения ...
-uv pip install --python "%PY%" "torch==%TORCH_VER%" "torchaudio==%TORCH_VER%" --index-url https://download.pytorch.org/whl/%TORCH_CUDA%
-if not errorlevel 1 goto :torch_ok
-echo [!] torch %TORCH_VER% недоступен для %TORCH_CUDA%, ставлю последнюю версию ...
-uv pip install --python "%PY%" torch torchaudio --index-url https://download.pytorch.org/whl/%TORCH_CUDA%
+echo [3/6] PyTorch (%TORCH_CHANNEL%) под ваш драйвер - около 3 ГБ, наберитесь терпения ...
+"%PY%" installer\setup_helper.py torch %TORCH_CHANNEL%
 if errorlevel 1 goto :fail
-:torch_ok
 
 rem ---------------------------------------------------- 5. зависимости
 echo [4/6] Зависимости приложения ...
