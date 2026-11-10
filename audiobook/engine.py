@@ -150,10 +150,27 @@ def _load_low_ram(path: str, device: str, optimize: bool, max_length: Optional[i
         config.max_length = int(max_length)
     tokenizer = LlamaTokenizerFast.from_pretrained(path)
 
-    vae_st = os.path.join(path, "audiovae.safetensors")
-    model_st = os.path.join(path, "model.safetensors")
-    if not (os.path.exists(vae_st) and os.path.exists(model_st)):
-        raise FileNotFoundError("нет safetensors-весов — нужен стандартный загрузчик")
+    def find(*names):
+        for n in names:
+            f = os.path.join(path, n)
+            if os.path.exists(f):
+                return f
+        return None
+
+    model_file = find("model.safetensors", "pytorch_model.bin")
+    vae_file = find("audiovae.safetensors", "audiovae.pth")
+    if not model_file or not vae_file:
+        raise FileNotFoundError(f"в {path} нет весов модели (model.safetensors / audiovae.pth)")
+
+    def load_weights(f):
+        """Веса — сразу на GPU, минуя ОЗУ (safetensors читается через mmap, .pth/.bin — с mmap=True)."""
+        if f.endswith(".safetensors"):
+            return load_file(f, device=device)
+        try:
+            ckpt = torch.load(f, map_location=device, weights_only=True, mmap=True)
+        except Exception:
+            ckpt = torch.load(f, map_location=device, weights_only=True)
+        return ckpt.get("state_dict", ckpt) if isinstance(ckpt, dict) else ckpt
 
     with torch.device(device):
         avc = getattr(config, "audio_vae_config", None)
@@ -162,8 +179,8 @@ def _load_low_ram(path: str, device: str, optimize: bool, max_length: Optional[i
     model = model.to(get_dtype(model.config.dtype))
     model.audio_vae = model.audio_vae.to(torch.float32)
 
-    state = load_file(model_st, device=device)
-    vae_state = load_file(vae_st, device=device)
+    state = load_weights(model_file)
+    vae_state = load_weights(vae_file)
     for k, v in vae_state.items():
         state[f"audio_vae.{k}"] = v
     missing, unexpected = model.load_state_dict(state, strict=False)
@@ -244,11 +261,19 @@ class TTSEngine:
         return self
 
     def _load_model(self, path: str, device: str, optimize: bool):
+        import torch
+
         if self.cfg.low_ram_load and device.startswith("cuda"):
             try:
                 return _load_low_ram(path, device, optimize, self.cfg.max_length)
             except Exception as e:
-                self.log(f"Экономная загрузка недоступна ({e}), использую стандартную.")
+                self.log(
+                    f"⚠ Экономная загрузка не удалась ({type(e).__name__}: {e}). Пробую стандартную — "
+                    "ей нужно ~14 ГБ свободной ОЗУ; если окно закроется без ошибки, значит не хватило памяти."
+                )
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
         from voxcpm.model.voxcpm2 import VoxCPM2Model
 
         return VoxCPM2Model.from_local(path, optimize=optimize, device=device)
