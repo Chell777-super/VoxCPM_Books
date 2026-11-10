@@ -158,6 +158,11 @@ def cmd_export(a):
         proj.settings.export.formats = tuple(x.strip() for x in a.formats.split(",") if x.strip())
     if a.bitrate:
         proj.settings.export.mp3_bitrate = a.bitrate
+    levels = {"part": 1, "chapter": 2, "section": 3}
+    if getattr(a, "split_by", None):
+        proj.settings.export.split_level = levels[a.split_by]
+    if getattr(a, "marks_by", None):
+        proj.settings.export.marker_level = levels[a.marks_by]
     proj.save()
     outs = export_book(proj, allow_missing=a.allow_missing)
     for o in outs:
@@ -215,6 +220,8 @@ def build_parser() -> argparse.ArgumentParser:
         p.add_argument("--formats", help="mp3,m4b,wav")
         p.add_argument("--bitrate", help="битрейт MP3, напр. 128k")
         p.add_argument("--allow-missing", action="store_true")
+        p.add_argument("--split-by", choices=["part", "chapter", "section"], help="файлы по разделам/главам/§ (по умолч. главам)")
+        p.add_argument("--marks-by", choices=["part", "chapter", "section"], help="метки в M4B (по умолч. §)")
 
     p = sub.add_parser("new", help="создать проект из PDF/TXT")
     p.add_argument("file")

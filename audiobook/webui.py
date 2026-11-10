@@ -15,7 +15,7 @@ import numpy as np
 import soundfile as sf
 
 from .audio import ExportOptions, fmt_duration, postprocess
-from .book import Book
+from .book import LEVEL_NAMES, Book
 from .engine import EngineConfig, SynthConfig, TTSEngine, VoiceConfig
 from .normalize import NormalizeOptions, normalize_text
 from .pdf_extract import ExtractOptions
@@ -96,11 +96,17 @@ def _chapters_table():
     if p is None:
         return []
     rows = []
+    levels = p.chapter_levels or [2] * len(p.chapter_titles)
+    indent = {1: "", 2: "   ", 3: "      "}
     for ci, title in enumerate(p.chapter_titles):
         segs = p.chapter_segments(ci)
         chars = sum(len(s.text) for s in segs)
         done = sum(1 for s in segs if s.status in ("done", "flagged"))
-        rows.append([ci + 1, title[:80], len(segs), chars, fmt_duration(estimate_duration_sec(chars)), f"{done}/{len(segs)}"])
+        lvl = levels[ci] if ci < len(levels) else 2
+        rows.append(
+            [ci + 1, LEVEL_NAMES.get(lvl, ""), indent.get(lvl, "") + title[:90], len(segs), chars,
+             fmt_duration(estimate_duration_sec(chars)), f"{done}/{len(segs)}"]
+        )
     return rows
 
 
@@ -119,7 +125,9 @@ def _segments_table(limit: int = 400, only_problems: bool = False):
     return rows
 
 
-def _settings_from_ui(first_page, last_page, chapter_mode, rm_headers, rm_foot, lang, numbers, abbr, target, maxc, minc, titles, merge):
+def _settings_from_ui(
+    first_page, last_page, chapter_mode, rm_headers, rm_foot, skip_toc, skip_service, lang, numbers, abbr, target, maxc, minc, titles, merge
+):
     p = _need_project()
     st = p.settings
     st.extract = ExtractOptions(
@@ -128,6 +136,8 @@ def _settings_from_ui(first_page, last_page, chapter_mode, rm_headers, rm_foot, 
         remove_headers=bool(rm_headers),
         remove_footnotes=bool(rm_foot),
         chapter_mode=CHAPTER_MODES.get(chapter_mode, "auto"),
+        skip_toc_pages=bool(skip_toc),
+        skip_service_pages=bool(skip_service),
     )
     st.normalize = NormalizeOptions(lang=lang, numbers_to_words=bool(numbers), expand_abbreviations=bool(abbr))
     maxc = max(int(maxc), int(target) + 20)
@@ -450,7 +460,10 @@ def on_mark_ok(idx):
 # --------------------------------------------------------------------------- #
 
 
-def on_export(formats, mp3_br, aac_br, sr, allow_missing, progress=gr.Progress()):
+SPLIT_LEVELS = {"Разделам": 1, "Главам": 2, "Параграфам (§)": 3}
+
+
+def on_export(formats, split_by, marks_by, mp3_br, aac_br, sr, allow_missing, progress=gr.Progress()):
     p = _need_project()
     if S.busy:
         raise gr.Error("Дождитесь окончания озвучки или остановите её.")
@@ -463,7 +476,14 @@ def on_export(formats, mp3_br, aac_br, sr, allow_missing, progress=gr.Progress()
         fm.append("wav")
     if not fm:
         raise gr.Error("Выберите хотя бы один формат.")
-    p.settings.export = ExportOptions(formats=tuple(fm), mp3_bitrate=mp3_br, aac_bitrate=aac_br, sample_rate=int(sr))
+    p.settings.export = ExportOptions(
+        formats=tuple(fm),
+        mp3_bitrate=mp3_br,
+        aac_bitrate=aac_br,
+        sample_rate=int(sr),
+        split_level=SPLIT_LEVELS.get(split_by, 2),
+        marker_level=SPLIT_LEVELS.get(marks_by, 3),
+    )
     p.save()
     logs = []
     outs = export_book(p, allow_missing=bool(allow_missing), log=logs.append, progress=lambda f, m: progress(f, desc=m))
@@ -498,6 +518,8 @@ def build_ui() -> gr.Blocks:
                         chapter_mode = gr.Dropdown(label="Главы", choices=list(CHAPTER_MODES), value=list(CHAPTER_MODES)[0])
                         rm_headers = gr.Checkbox(label="Удалять колонтитулы и номера страниц", value=True)
                         rm_foot = gr.Checkbox(label="Удалять сноски", value=True)
+                        skip_toc = gr.Checkbox(label="Пропускать страницы оглавления", value=True)
+                        skip_service = gr.Checkbox(label="Пропускать выходные данные (УДК, ББК, ISBN, ©)", value=True)
                         lang = gr.Radio(label="Язык", choices=["ru", "en"], value="ru")
                         numbers = gr.Checkbox(label="Числа → слова (обычно не нужно, модель читает цифры сама)", value=False)
                         abbr = gr.Checkbox(label="Раскрывать сокращения (т. е., и т. д., см. …)", value=True)
@@ -513,7 +535,7 @@ def build_ui() -> gr.Blocks:
                 with gr.Column(scale=2):
                     parse_msg = gr.Markdown()
                     chapters_df = gr.Dataframe(
-                        headers=["№", "Глава", "Сегм.", "Симв.", "≈ Длит.", "Озвучено"], value=_chapters_table(), interactive=False, wrap=True
+                        headers=["№", "Уровень", "Название", "Сегм.", "Симв.", "≈ Длит.", "Озвучено"], value=_chapters_table(), interactive=False, wrap=True
                     )
             with gr.Accordion("✏ Редактировать текст книги (# Заголовок главы, пустая строка между абзацами)", open=False):
                 book_text = gr.Textbox(lines=24, max_lines=40, show_label=False)
@@ -521,7 +543,7 @@ def build_ui() -> gr.Blocks:
             with gr.Accordion("Сегменты (первые 400)", open=False):
                 segs_df = gr.Dataframe(headers=["#", "Гл.", "", "Симв.", "Текст", "Заметка"], value=_segments_table(), interactive=False, wrap=True)
 
-        parse_settings = [first_page, last_page, chapter_mode, rm_headers, rm_foot, lang, numbers, abbr, target, maxc, minc, titles, merge]
+        parse_settings = [first_page, last_page, chapter_mode, rm_headers, rm_foot, skip_toc, skip_service, lang, numbers, abbr, target, maxc, minc, titles, merge]
         parse_out = [parse_msg, chapters_df, segs_df, book_text, status_md, proj_dd]
 
         # ------------------------------------------------------------ Голос
@@ -595,6 +617,11 @@ def build_ui() -> gr.Blocks:
                 value=["MP3 по главам", "M4B (одним файлом, с главами)"],
             )
             with gr.Row():
+                split_by = gr.Radio(label="Отдельные файлы по", choices=["Разделам", "Главам", "Параграфам (§)"], value="Главам")
+                marks_by = gr.Radio(
+                    label="Метки глав внутри M4B по", choices=["Разделам", "Главам", "Параграфам (§)"], value="Параграфам (§)"
+                )
+            with gr.Row():
                 mp3_br = gr.Dropdown(label="Битрейт MP3", choices=["64k", "96k", "128k", "192k"], value="128k")
                 aac_br = gr.Dropdown(label="Битрейт AAC (M4B)", choices=["48k", "64k", "96k", "128k"], value="96k")
                 out_sr = gr.Dropdown(label="Частота", choices=["48000", "44100", "24000"], value="48000")
@@ -628,7 +655,7 @@ def build_ui() -> gr.Blocks:
         save_seg_btn.click(on_save_segment_text, inputs=[seg_idx, seg_text], outputs=[job_msg, segs_df])
         problems_btn.click(lambda: _segments_table(limit=1000, only_problems=True), outputs=problems_df)
 
-        export_btn.click(on_export, inputs=[formats, mp3_br, aac_br, out_sr, allow_missing], outputs=[export_files, export_log, export_msg])
+        export_btn.click(on_export, inputs=[formats, split_by, marks_by, mp3_br, aac_br, out_sr, allow_missing], outputs=[export_files, export_log, export_msg])
 
         # При запуске открываем последний проект (если есть)
         def _autoload(name):

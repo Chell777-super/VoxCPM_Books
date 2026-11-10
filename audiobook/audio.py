@@ -141,21 +141,32 @@ class ExportOptions:
     aac_bitrate: str = "96k"
     sample_rate: int = 48000  # 48000 (оригинал) / 44100 / 24000
     target_db: float = -20.0
+    split_level: int = 2  # файлы по: 1 — разделам, 2 — главам, 3 — параграфам
+    marker_level: int = 3  # метки глав в M4B до этого уровня
 
 
 def assemble_chapter(
-    items: Iterable[Tuple[str, int]],
+    items: Iterable[tuple],
     out_wav: str | Path,
     sr: int,
     lead_in_ms: int = 300,
-) -> float:
-    """Склеивает [(путь_к_сегменту, пауза_после_мс)] в один WAV. Возвращает длительность, с."""
+) -> tuple:
+    """Склеивает [(путь, пауза_мс[, метка])] в один WAV.
+
+    Возвращает (длительность_с, [(метка, начало_с)]) — метка ставится там, где она указана
+    (начало главы/параграфа внутри файла).
+    """
     total = 0
+    markers = []
     with sf.SoundFile(str(out_wav), "w", samplerate=sr, channels=1, subtype="PCM_16", format="WAV") as out:
         lead = np.zeros(int(sr * lead_in_ms / 1000), dtype=np.float32)
         out.write(lead)
         total += len(lead)
-        for path, pause_ms in items:
+        for item in items:
+            path, pause_ms = item[0], item[1]
+            mark = item[2] if len(item) > 2 else None
+            if mark:
+                markers.append((mark, 0.0 if total == len(lead) else total / sr))  # первая метка — с начала файла
             wav, file_sr = sf.read(path, dtype="float32")
             if file_sr != sr:
                 raise RuntimeError(f"Частота дискретизации {path} = {file_sr}, ожидалось {sr}")
@@ -163,7 +174,7 @@ def assemble_chapter(
             pause = np.zeros(int(sr * pause_ms / 1000), dtype=np.float32)
             out.write(pause)
             total += len(wav) + len(pause)
-    return total / sr
+    return total / sr, markers
 
 
 def encode_mp3(
@@ -191,8 +202,8 @@ def encode_mp3(
 
 def build_m4b(
     chapter_wavs: Sequence[str],
-    chapter_titles: Sequence[str],
-    chapter_durations: Sequence[float],
+    markers: Sequence[Tuple[str, float]],
+    total_duration: float,
     out_path: str,
     opts: ExportOptions,
     title: str = "",
@@ -200,6 +211,7 @@ def build_m4b(
     cover: Optional[str] = None,
     work_dir: Optional[str] = None,
 ) -> None:
+    """Склеивает WAV-файлы в M4B. markers — [(название, начало_с)] от начала книги."""
     work = Path(work_dir or Path(out_path).parent)
     lst = work / "_concat.txt"
     meta = work / "_chapters.txt"
@@ -214,11 +226,12 @@ def build_m4b(
         if artist:
             f.write(f"artist={_meta_escape(artist)}\n")
         f.write("genre=Audiobook\n")
-        t = 0
-        for name, dur in zip(chapter_titles, chapter_durations):
-            start_ms = int(round(t * 1000))
-            t += dur
-            f.write(f"\n[CHAPTER]\nTIMEBASE=1/1000\nSTART={start_ms}\nEND={int(round(t * 1000))}\n")
+        ms = sorted(markers, key=lambda m: m[1])
+        for k, (name, start) in enumerate(ms):
+            end = ms[k + 1][1] if k + 1 < len(ms) else total_duration
+            if end - start < 0.05:
+                continue
+            f.write(f"\n[CHAPTER]\nTIMEBASE=1/1000\nSTART={int(round(start * 1000))}\nEND={int(round(end * 1000))}\n")
             f.write(f"title={_meta_escape(name)}\n")
     args = ["-f", "concat", "-safe", "0", "-i", str(lst), "-i", str(meta)]
     has_cover = bool(cover and os.path.exists(cover))

@@ -23,7 +23,7 @@ import re
 from dataclasses import asdict, dataclass
 from typing import List, Optional, Tuple
 
-from .book import Book
+from .book import SUBHEAD_PREFIX, Book
 from .normalize import NormalizeOptions, normalize_text, speakable
 
 
@@ -238,32 +238,46 @@ def segment_book(
             add(ci, _heading_text(normalize_text(ch.title, norm_opts)), "heading", seg_opts.pause_heading_ms, True)
 
         # нормализуем абзацы и объединяем короткие реплики
-        paras: List[Tuple[str, bool]] = []  # (текст, после него смена сцены)
+        # элемент: (текст, смена_сцены_после, это_подзаголовок)
+        paras: List[Tuple[str, bool, bool]] = []
         for p in ch.paragraphs:
             if p.strip() == "* * *":
                 if paras:
-                    paras[-1] = (paras[-1][0], True)
+                    paras[-1] = (paras[-1][0], True, paras[-1][2])
+                continue
+            if p.startswith(SUBHEAD_PREFIX):
+                t = _heading_text(normalize_text(p[len(SUBHEAD_PREFIX):], norm_opts))
+                if t:
+                    paras.append((t, False, True))
                 continue
             t = normalize_text(p, norm_opts)
             if t:
-                paras.append((t, False))
+                paras.append((t, False, False))
 
-        merged: List[Tuple[str, bool]] = []
-        for t, scene in paras:
+        merged: List[Tuple[str, bool, bool]] = []
+        for t, scene, sub in paras:
             if (
                 seg_opts.merge_short_paragraphs
+                and not sub
                 and merged
                 and not merged[-1][1]
+                and not merged[-1][2]
                 and (len(t) < seg_opts.min_chars or len(merged[-1][0]) < seg_opts.min_chars)
                 and len(merged[-1][0]) < seg_opts.min_chars * 2.5
                 and len(t) < seg_opts.min_chars * 2.5
                 and len(merged[-1][0]) + 1 + len(t) <= seg_opts.target_chars
             ):
-                merged[-1] = (merged[-1][0] + " " + t, scene)
+                merged[-1] = (merged[-1][0] + " " + t, scene, False)
             else:
-                merged.append((t, scene))
+                merged.append((t, scene, sub))
 
-        for t, scene in merged:
+        for t, scene, sub in merged:
+            if sub:
+                # подзаголовок: пауза перед ним (у предыдущего сегмента) и после
+                if segs and segs[-1].chapter == ci:
+                    segs[-1].pause_ms = max(segs[-1].pause_ms, seg_opts.pause_heading_ms)
+                add(ci, t, "heading", seg_opts.pause_heading_ms, True)
+                continue
             parts = split_paragraph(t, seg_opts, lang)
             for k, part in enumerate(parts):
                 last = k == len(parts) - 1

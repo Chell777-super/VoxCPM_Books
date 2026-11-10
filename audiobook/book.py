@@ -9,11 +9,20 @@ from pathlib import Path
 from typing import List
 
 
+# Подзаголовок внутри главы («Основные понятия») хранится как абзац с этим префиксом.
+SUBHEAD_PREFIX = "#### "
+
+LEVEL_NAMES = {1: "Раздел", 2: "Глава", 3: "§"}
+
+
 @dataclass
 class Chapter:
+    """Структурная единица книги. level: 1 — раздел/часть, 2 — глава, 3 — параграф (§)."""
+
     title: str
     paragraphs: List[str] = field(default_factory=list)
     start_page: int | None = None
+    level: int = 2
 
     @property
     def n_chars(self) -> int:
@@ -50,7 +59,7 @@ class Book:
 
     # ------------------------------------------------------------ text format
     # Простой формат для ручной правки:
-    #   # Название главы
+    #   # Раздел   ## Глава   ### Параграф   #### подзаголовок внутри текста
     #   (пустая строка между абзацами)
     #   Абзац текста...
     def to_text(self) -> str:
@@ -62,7 +71,7 @@ class Book:
         if out:
             out.append("")
         for ch in self.chapters:
-            out.append(f"# {ch.title}".rstrip())
+            out.append(f"{'#' * max(1, min(3, ch.level))} {ch.title}".rstrip())
             out.append("")
             for p in ch.paragraphs:
                 out.append(p)
@@ -78,7 +87,7 @@ class Book:
         """
         book = cls(title=default_title)
         lines = text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
-        has_md_headings = any(l.startswith("# ") or l == "#" for l in lines)
+        has_md_headings = any(re.match(r"^#{1,3}(\s|$)", l) for l in lines)
 
         chapters: List[Chapter] = []
         buf: List[str] = []
@@ -91,7 +100,11 @@ class Book:
                     chapters.append(Chapter(title=""))
                 chapters[-1].paragraphs.append(par)
 
-        from .pdf_extract import looks_like_heading  # локальный импорт: без цикла
+        from .pdf_extract import heading_level  # локальный импорт: без цикла
+
+        # Если в файле только «#» (старый формат) — это главы, а не разделы
+        md_levels = {len(m.group(1)) for l in lines for m in [re.match(r"^(#{1,3})(\s|$)", l)] if m}
+        single = len(md_levels) == 1
 
         for line in lines:
             s = line.strip()
@@ -101,16 +114,24 @@ class Book:
             if s.startswith("%author "):
                 book.author = s[8:].strip()
                 continue
-            is_heading = False
+            level = 0
             title = ""
-            if has_md_headings:
-                if s.startswith("#"):
-                    is_heading, title = True, s.lstrip("#").strip()
-            elif s and looks_like_heading(s):
-                is_heading, title = True, s
-            if is_heading:
+            if s.startswith("####"):
                 flush_par()
-                chapters.append(Chapter(title=title))
+                buf.append(SUBHEAD_PREFIX + s.lstrip("#").strip())
+                flush_par()
+                continue
+            if has_md_headings:
+                m = re.match(r"^(#{1,3})(\s|$)", s)
+                if m:
+                    level = 2 if single else len(m.group(1))
+                    title = s.lstrip("#").strip()
+            elif s:
+                level = heading_level(s)
+                title = s
+            if level:
+                flush_par()
+                chapters.append(Chapter(title=title, level=level))
             elif not s:
                 flush_par()
             else:

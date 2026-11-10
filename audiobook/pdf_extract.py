@@ -19,7 +19,7 @@ from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from typing import Iterable, List, Optional
 
-from .book import Book, Chapter
+from .book import SUBHEAD_PREFIX, Book, Chapter
 
 
 def _pymupdf():
@@ -92,6 +92,26 @@ def ends_sentence(s: str) -> bool:
     return bool(SENT_END_RE.search(s))
 
 
+_L1_WORDS = {"раздел", "часть", "книга", "том", "part", "book", "volume"}
+SUBSECTION_RE = re.compile(r"^\s*(?:§\s*\d+|параграф\s+\d+)", re.IGNORECASE)
+NUMBERED_SUB_RE = re.compile(r"^\s*\d{1,2}\.\d{1,2}\.?\s+[A-ZА-ЯЁ]")
+SERVICE_PAGE_RE = re.compile(r"\bISBN\b|\bУДК\b|\bББК\b|©")
+NUM_EDGE_RE = re.compile(r"^\d{1,4}\s+\S.{8,}$|^.{8,}\S\s+\d{1,4}$")
+
+
+def heading_level(s: str) -> int:
+    """Уровень заголовка по тексту: 1 — Раздел/Часть/Том, 2 — Глава/Предисловие, 3 — §. 0 — не заголовок."""
+    s = s.strip()
+    if not s or len(s) > 120:
+        return 0
+    if SUBSECTION_RE.match(s):
+        return 3 if not (len(s) > 100 and ends_sentence(s)) else 0
+    if not looks_like_heading(s):
+        return 0
+    first = re.split(r"[\s.:]+", s.lower(), maxsplit=1)[0]
+    return 1 if first in _L1_WORDS else 2
+
+
 def looks_like_heading(s: str) -> bool:
     s = s.strip()
     if not s or len(s) > 90:
@@ -120,7 +140,9 @@ class Line:
     bold: bool = False
     page_h: float = 0.0
     page_w: float = 0.0
-    kind: str = "text"  # text | heading | scene
+    kind: str = "text"  # text | heading | subheading | scene
+    level: int = 0  # для heading: 1 — раздел, 2 — глава, 3 — параграф
+    cont: bool = False  # продолжение многострочного заголовка
 
 
 @dataclass
@@ -130,7 +152,9 @@ class ExtractOptions:
     remove_headers: bool = True
     remove_footnotes: bool = True
     chapter_mode: str = "auto"  # auto | toc | font | regex | none
-    toc_level: int = 1
+    toc_level: int = 3
+    skip_toc_pages: bool = True  # выкидывать страницы оглавления
+    skip_service_pages: bool = True  # УДК/ББК/ISBN/© — выходные данные
     margin_ratio: float = 0.085  # доля высоты страницы, считающаяся полем
 
 
@@ -139,6 +163,7 @@ class ExtractReport:
     pages: int = 0
     removed_headers: int = 0
     removed_footnotes: int = 0
+    removed_pages: int = 0
     chapter_source: str = ""
     warnings: List[str] = field(default_factory=list)
 
@@ -263,11 +288,38 @@ def _remove_headers(lines: List[Line], opts: ExtractOptions, rep: ExtractReport)
             if PAGE_NUM_RE.match(ln.text):
                 rep.removed_headers += 1
                 continue
+            # «20  Раздел I. Общие положения», «Глава 1. … право  19» — колонтитул с номером страницы
+            if NUM_EDGE_RE.match(ln.text) and not ends_sentence(ln.text):
+                rep.removed_headers += 1
+                continue
             if key and len(pages_by_key[key]) >= min_repeat and (not ends_sentence(ln.text) or key == "#"):
                 rep.removed_headers += 1
                 continue
         out.append(ln)
     return out
+
+
+def _remove_pages(lines: List[Line], opts: ExtractOptions, rep: ExtractReport) -> List[Line]:
+    """Убирает страницы оглавления и выходных данных (УДК/ББК/ISBN)."""
+    by_page = defaultdict(list)
+    for ln in lines:
+        by_page[ln.page].append(ln)
+    drop = set()
+    first_heading_page = None
+    for p in sorted(by_page):
+        ls = by_page[p]
+        n = len(ls)
+        leaders = sum(1 for l in ls if TOC_LEADER_RE.search(l.text))
+        num_end = sum(1 for l in ls if re.search(r"\S\s+\d{1,4}$", l.text) and not ends_sentence(l.text))
+        if opts.skip_toc_pages and ((leaders >= 3 and leaders >= 0.2 * n) or (num_end >= 6 and num_end >= 0.5 * n)):
+            drop.add(p)
+            continue
+        if first_heading_page is None and any(heading_level(l.text) for l in ls):
+            first_heading_page = p
+        if opts.skip_service_pages and first_heading_page is None and any(SERVICE_PAGE_RE.search(l.text) for l in ls):
+            drop.add(p)
+    rep.removed_pages += len(drop)
+    return [ln for ln in lines if ln.page not in drop]
 
 
 def _remove_footnotes(lines: List[Line], body: float, rep: ExtractReport) -> List[Line]:
@@ -293,23 +345,82 @@ def _remove_footnotes(lines: List[Line], body: float, rep: ExtractReport) -> Lis
 # --------------------------------------------------------------------------- #
 
 
+def _centered(ln: Line, left: Optional[float] = None) -> bool:
+    """Строка выровнена по центру (а не просто короткая строка с абзацным отступом)."""
+    sym = abs((ln.x0 + ln.x1) / 2 - ln.page_w / 2) < ln.page_w * 0.06
+    narrow = (ln.x1 - ln.x0) < ln.page_w * 0.75
+    if left is not None:
+        # отступ слева заметно больше абзацного (≈ 1–1.5 em)
+        return sym and narrow and ln.x0 - left > 2.2 * max(ln.size, 1.0)
+    return sym and narrow
+
+
+def _styled(ln: Line, body: float, left: Optional[float] = None) -> bool:
+    """Строка оформлена как заголовок: жирная, крупнее, или по центру."""
+    return ln.bold or ln.size >= body * 1.1 or _centered(ln, left)
+
+
+def _gap_above(lines: List[Line], i: int) -> float:
+    ln = lines[i]
+    if i == 0 or lines[i - 1].page != ln.page:
+        return 99.0
+    return ln.y0 - lines[i - 1].y1
+
+
 def _mark_headings(lines: List[Line], body: float, use_font: bool, use_regex: bool) -> None:
+    margins = _page_margins(lines)
     for i, ln in enumerate(lines):
+        left = margins.get(ln.page, (None, None))[0]
         t = ln.text
+        if ln.kind == "heading":
+            continue
         if SCENE_BREAK_RE.match(t):
             ln.kind = "scene"
             continue
         if len(t) > 120:
             continue
         big = ln.size >= body * 1.18
-        if use_regex and looks_like_heading(t):
-            ln.kind = "heading"
+        lvl = heading_level(t) if use_regex else 0
+        # Строка «Глава 1 ГК РФ …» внутри абзаца — не заголовок: требуем оформления
+        if lvl and (_styled(ln, body, left) or _isolated(lines, i)):
+            ln.kind, ln.level = "heading", lvl
         elif use_font and big and len(t) <= 100 and not TOC_LEADER_RE.search(t):
-            ln.kind = "heading"
+            ln.kind, ln.level = "heading", heading_level(t) or 2
         elif use_font and ROMAN_OR_NUM_RE.match(t) and (big or ln.bold):
-            ln.kind = "heading"
+            ln.kind, ln.level = "heading", 2
         elif use_regex and ROMAN_OR_NUM_RE.match(t) and _isolated(lines, i):
-            ln.kind = "heading"
+            ln.kind, ln.level = "heading", 2
+        elif (
+            use_regex
+            and ln.bold
+            and len(t) <= 90
+            and not ends_sentence(t)
+            and (_centered(ln, left) or NUMBERED_SUB_RE.match(t))
+            and _gap_above(lines, i) > 0.3 * body
+        ):
+            ln.kind = "subheading"  # «Основные понятия», «1.1. Основные положения»
+    _mark_heading_continuations(lines, body, margins)
+
+
+def _mark_heading_continuations(lines: List[Line], body: float, margins: dict) -> None:
+    """«Глава 1. Предпринимательство» + «и предпринимательское право» — один заголовок."""
+    for i in range(1, len(lines)):
+        prev, ln = lines[i - 1], lines[i]
+        if prev.kind not in ("heading", "subheading") or ln.kind != "text" or prev.page != ln.page:
+            continue
+        h = max(prev.y1 - prev.y0, body)
+        gap = ln.y0 - prev.y1
+        left = margins.get(ln.page, (ln.x0, None))[0]
+        indented_like_heading = ln.x0 - left > 2.2 * body or not _centered(prev)
+        same_style = (ln.bold == prev.bold) and ln.size >= prev.size * 0.9 and indented_like_heading
+        if (
+            same_style
+            and len(ln.text) <= 100
+            and gap < 0.9 * h
+            and not ends_sentence(prev.text)
+            and (ln.text[:1].islower() or gap < 0.45 * h)
+        ):
+            ln.kind, ln.level, ln.cont = prev.kind, prev.level, True
 
 
 def _isolated(lines: List[Line], i: int) -> bool:
@@ -328,30 +439,31 @@ def _norm_title(s: str) -> str:
 
 
 def _apply_toc(doc, lines: List[Line], level: int) -> bool:
-    """Размечает начала глав по оглавлению PDF. Возвращает True при успехе."""
+    """Размечает заголовки по закладкам PDF (outline). Возвращает True при успехе."""
     toc = [e for e in doc.get_toc(simple=True) if e[0] <= level and e[2] >= 1]
     if len(toc) < 2:
         return False
     for ln in lines:
         if ln.kind == "heading":
-            ln.kind = "text"
+            ln.kind, ln.level, ln.cont = "text", 0, False
     by_page = defaultdict(list)
     for i, ln in enumerate(lines):
         by_page[ln.page].append(i)
     used = set()
     found = 0
-    for _, title, page1 in toc:
+    for toc_lvl, title, page1 in toc:
         p = page1 - 1
         nt = _norm_title(title)
         if not nt:
             continue
-        cand = by_page.get(p, [])[:12] + by_page.get(p + 1, [])[:4]
+        lvl = heading_level(title) or min(3, toc_lvl)
+        cand = by_page.get(p, [])[:20] + by_page.get(p + 1, [])[:6]
         for i in cand:
             if i in used:
                 continue
             lt = _norm_title(lines[i].text)
             if lt and (lt == nt or nt.startswith(lt) or lt.startswith(nt)):
-                lines[i].kind = "heading"
+                lines[i].kind, lines[i].level = "heading", lvl
                 used.add(i)
                 found += 1
                 # Многострочный заголовок: следующие строки, продолжающие название
@@ -360,7 +472,7 @@ def _apply_toc(doc, lines: List[Line], level: int) -> bool:
                 while j < len(lines) and lines[j].page == lines[i].page and len(acc) < len(nt):
                     nxt = _norm_title(lines[j].text)
                     if nxt and nt.startswith((acc + " " + nxt).strip()):
-                        lines[j].kind = "heading"
+                        lines[j].kind, lines[j].level, lines[j].cont = "heading", lvl, True
                         used.add(j)
                         acc = (acc + " " + nxt).strip()
                         j += 1
@@ -410,7 +522,7 @@ def _page_margins(lines: List[Line]):
 
 
 def _build(lines: List[Line], body: float) -> List[tuple]:
-    """Возвращает список элементов ("heading"|"par"|"scene", text)."""
+    """Возвращает список элементов [вид, текст, уровень]: heading | subheading | par | scene."""
     margins = _page_margins(lines)
     items: List[list] = []
     prev: Optional[Line] = None
@@ -439,19 +551,19 @@ def _build(lines: List[Line], body: float) -> List[tuple]:
         return indent or prev_short or starts_dialog
 
     for ln in lines:
-        if ln.kind == "heading":
-            if items and items[-1][0] == "heading" and prev is not None and prev.kind == "heading" and prev.page == ln.page:
-                items[-1][1] = items[-1][1].rstrip(".") + ". " + ln.text
+        if ln.kind in ("heading", "subheading"):
+            if ln.cont and items and items[-1][0] == ln.kind:
+                items[-1][1] = join_lines(items[-1][1], ln.text)
             else:
-                items.append(["heading", ln.text])
+                items.append([ln.kind, ln.text, ln.level])
         elif ln.kind == "scene":
-            items.append(["scene", "* * *"])
+            items.append(["scene", "* * *", 0])
         else:
             if TOC_LEADER_RE.search(ln.text):  # строка оглавления «Глава 1 ....... 5»
                 prev = ln
                 continue
             if new_par(ln):
-                items.append(["par", ln.text])
+                items.append(["par", ln.text, 0])
             else:
                 items[-1][1] = join_lines(items[-1][1], ln.text)
         prev = ln
@@ -460,23 +572,21 @@ def _build(lines: List[Line], body: float) -> List[tuple]:
 
 def _to_book(items: List[tuple], split_chapters: bool) -> List[Chapter]:
     chapters: List[Chapter] = []
-    for kind, text in items:
+    for kind, text, level in items:
         if kind == "heading" and split_chapters:
-            # Подряд идущие заголовки без текста («Часть I» + «Глава 1») — объединяем
-            if chapters and not chapters[-1].paragraphs and chapters[-1].title:
-                chapters[-1].title = chapters[-1].title.rstrip(".") + ". " + text
-            else:
-                chapters.append(Chapter(title=text))
+            chapters.append(Chapter(title=text, level=level or 2))
             continue
         if not chapters:
-            chapters.append(Chapter(title=""))
+            chapters.append(Chapter(title="", level=2))
         if kind == "scene":
             if chapters[-1].paragraphs and chapters[-1].paragraphs[-1] != "* * *":
                 chapters[-1].paragraphs.append("* * *")
+        elif kind in ("subheading", "heading"):
+            chapters[-1].paragraphs.append(SUBHEAD_PREFIX + text)
         else:
             chapters[-1].paragraphs.append(text)
     for ch in chapters:
-        while ch.paragraphs and ch.paragraphs[-1] == "* * *":
+        while ch.paragraphs and (ch.paragraphs[-1] == "* * *" or ch.paragraphs[-1].startswith(SUBHEAD_PREFIX)):
             ch.paragraphs.pop()
     return [c for c in chapters if c.paragraphs or c.title]
 
@@ -508,6 +618,7 @@ def extract_pdf(path: str, opts: Optional[ExtractOptions] = None) -> tuple[Book,
             return Book(title=doc.metadata.get("title") or "", source=path), rep
 
         body = _body_size(lines)
+        lines = _remove_pages(lines, opts, rep)
         if opts.remove_headers:
             lines = _remove_headers(lines, opts, rep)
         if opts.remove_footnotes:
@@ -517,7 +628,8 @@ def extract_pdf(path: str, opts: Optional[ExtractOptions] = None) -> tuple[Book,
         if mode in ("auto", "toc"):
             _mark_headings(lines, body, use_font=False, use_regex=False)  # только scene-break
             if _apply_toc(doc, lines, opts.toc_level):
-                rep.chapter_source = "оглавление PDF"
+                rep.chapter_source = "закладки (оглавление) PDF"
+                _mark_headings(lines, body, use_font=False, use_regex=True)  # подзаголовки и §, которых нет в закладках
             elif mode == "toc":
                 rep.warnings.append("Оглавление PDF не найдено или не совпало с текстом — использую шрифт и шаблоны.")
                 mode = "auto"
@@ -538,7 +650,7 @@ def extract_pdf(path: str, opts: Optional[ExtractOptions] = None) -> tuple[Book,
         chapters = _to_book(items, split_chapters=mode != "none")
 
         # Слишком много «глав» — признак ложных срабатываний по шрифту
-        if mode == "auto" and len(chapters) > max(60, rep.pages // 2):
+        if mode == "auto" and len([c for c in chapters if c.level <= 2]) > max(60, rep.pages // 2):
             rep.warnings.append(
                 f"Найдено подозрительно много глав ({len(chapters)}). "
                 "Попробуйте режим «шаблоны» или «оглавление»."

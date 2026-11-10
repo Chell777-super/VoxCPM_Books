@@ -264,8 +264,9 @@ def test_postprocess_and_assemble(tmp_path):
     assert np.max(np.abs(out)) <= 10 ** (-1.5 / 20) + 1e-6
     p = tmp_path / "a.flac"
     write_segment(p, out, sr)
-    dur = assemble_chapter([(str(p), 500), (str(p), 0)], tmp_path / "ch.wav", sr, lead_in_ms=0)
+    dur, marks = assemble_chapter([(str(p), 500, "А"), (str(p), 0, "Б")], tmp_path / "ch.wav", sr, lead_in_ms=0)
     assert abs(dur - (2 * len(out) / sr + 0.5)) < 0.01
+    assert marks[0] == ("А", 0.0) and abs(marks[1][1] - (len(out) / sr + 0.5)) < 0.01
     assert sf.info(str(tmp_path / "ch.wav")).samplerate == sr
 
 
@@ -306,3 +307,159 @@ def test_project_resume_keys(tmp_path, book_pdf):
 )
 def test_normalize_units_and_abbr(src, expected):
     assert normalize_text(src) == expected
+
+
+# --------------------------------------------------------------------------- #
+# Учебник: Раздел → Глава → §, оглавление, колонтитулы с номерами страниц
+# --------------------------------------------------------------------------- #
+
+FONT_BOLD = next(
+    (f for f in ["/usr/share/fonts/truetype/dejavu/DejaVuSerif-Bold.ttf", "C:/Windows/Fonts/timesbd.ttf"] if os.path.exists(f)),
+    None,
+)
+
+_BODY = (
+    "Предпринимательство — одна из форм деятельности человека. Деятельность человека — форма "
+    "проявления его активности, определенное поведение; в более широком плане — использование "
+    "жизненных сил, человеческой энергии. Предпринимать — значит начать делать что-либо, "
+    "приступить к чему-либо. Когда мы говорим «предприимчивый человек», то имеем в виду умеющего "
+    "сделать что-либо в нужный момент, находчивого, изобретательного, практичного человека."
+)
+
+
+def _wrap(text, width=62):
+    words, lines, cur = text.split(), [], ""
+    for w in words:
+        if len(cur) + len(w) + 1 > width:
+            lines.append(cur)
+            cur = w
+        else:
+            cur = (cur + " " + w).strip()
+    lines.append(cur)
+    return lines
+
+
+def _make_textbook_pdf(path):
+    pymupdf = pytest.importorskip("pymupdf")
+    if FONT is None or FONT_BOLD is None:
+        pytest.skip("нет TTF-шрифтов")
+    doc = pymupdf.open()
+    W, H, L = 420, 600, 40
+    lh = 13
+
+    def page(header=None):
+        pg = doc.new_page(width=W, height=H)
+        pg.insert_font(fontname="F", fontfile=FONT)
+        pg.insert_font(fontname="B", fontfile=FONT_BOLD)
+        if header:
+            pg.insert_text((L, 25), header, fontsize=7, fontname="F")
+        return pg
+
+    def text(pg, y, s, size=9.5, bold=False, x=L, center=False):
+        if center:
+            x = (W - pymupdf.Font(fontfile=FONT_BOLD if bold else FONT).text_length(s, fontsize=size)) / 2
+        pg.insert_text((x, y), s, fontsize=size, fontname="B" if bold else "F")
+        return y + lh
+
+    def para(pg, y, s):
+        for k, ln in enumerate(_wrap(s)):
+            y = text(pg, y, ln, x=L + (12 if k == 0 else 0))
+        return y
+
+    # 1. выходные данные
+    p = page()
+    text(p, 80, "УДК 351.824.1  ББК 67.404.91  ISBN 978-5-00156-")
+    text(p, 100, "Учебник подготовлен на кафедре предпринимательского права.")
+    # 2. оглавление (страница с точками-заполнителями)
+    p = page()
+    y = text(p, 60, "Оглавление", bold=True, center=True) + 10
+    for s in [
+        "Раздел I. Общие положения",
+        "Глава 1. Предпринимательство и предпринимательское право ..... 18",
+        "§ 1. Понятие предпринимательства и предпринимательской",
+        "деятельности .................................................. 20",
+        "§ 2. Предпринимательское право ............................ 40",
+        "Глава 2. Источники предпринимательского права ........ 78",
+        "Глава 3. Право на занятие предпринимательской деятельностью.",
+        "Правовой статус предпринимателя ....................... 114",
+    ]:
+        y = text(p, y, s)
+    # 3. Раздел I + Глава 1 (две строки) + Основные понятия
+    p = page()
+    y = text(p, 90, "Раздел I. Общие положения", size=11, bold=True, center=True) + 14
+    y = text(p, y, "Глава 1. Предпринимательство", size=10.5, bold=True, center=True)
+    y = text(p, y, "и предпринимательское право", size=10.5, bold=True, center=True) + 12
+    y = text(p, y, "Основные понятия", bold=True, center=True) + 4
+    y = para(p, y, "Предприниматель — лицо, осуществляющее предпринимательскую деятельность.")
+    # 4. колонтитул «20  Раздел I. Общие положения» + § 1 (две строки) + сноска
+    p = page("20                                   Раздел I. Общие положения")
+    y = text(p, 60, "§ 1. Понятие предпринимательства", bold=True, center=True)
+    y = text(p, y, "и предпринимательской деятельности", bold=True, center=True) + 8
+    y = para(p, y, _BODY)
+    y = para(p, y, "Глава 1 этого учебника посвящена основам, а предпринимательская деятельность в системе")
+    text(p, H - 50, "¹ См.: Гинс Г. К. Предприниматель. М., 1992.", size=6.5)
+    # 5. колонтитул «Глава 1. … право  21» + продолжение абзаца
+    p = page("Глава 1. Предпринимательство и предпринимательское право                21")
+    y = para(p, 60, "современного российского права анализируется и исследуется главным образом предпринимательским правом.")
+    # 6. Глава 2 + § 1
+    p = page("22                                   Раздел I. Общие положения")
+    y = text(p, 90, "Глава 2. Источники", size=10.5, bold=True, center=True)
+    y = text(p, y, "предпринимательского права", size=10.5, bold=True, center=True) + 12
+    y = text(p, y, "§ 1. Понятие и виды источников", bold=True, center=True) + 8
+    y = para(p, y, _BODY)
+    doc.save(path)
+    doc.close()
+
+
+@pytest.fixture()
+def textbook_pdf(tmp_path):
+    p = tmp_path / "textbook.pdf"
+    _make_textbook_pdf(str(p))
+    return str(p)
+
+
+def test_textbook_hierarchy(textbook_pdf):
+    book, rep = extract_pdf(textbook_pdf)
+    got = [(c.level, c.title) for c in book.chapters]
+    assert got == [
+        (1, "Раздел I. Общие положения"),
+        (2, "Глава 1. Предпринимательство и предпринимательское право"),
+        (3, "§ 1. Понятие предпринимательства и предпринимательской деятельности"),
+        (2, "Глава 2. Источники предпринимательского права"),
+        (3, "§ 1. Понятие и виды источников"),
+    ], got
+    assert rep.removed_pages == 2  # выходные данные + оглавление
+    all_text = " ".join(p for c in book.chapters for p in c.paragraphs)
+    assert "ISBN" not in all_text and "....." not in all_text
+    assert "Раздел I. Общие положения" not in all_text  # колонтитулы
+    assert "Гинс" not in all_text  # сноска
+    # подзаголовок внутри главы
+    assert book.chapters[1].paragraphs[0] == "#### Основные понятия"
+    # «Глава 1 этого учебника …» в тексте — не заголовок; абзац склеен через страницу
+    assert any("в системе современного российского права" in p for p in book.chapters[2].paragraphs)
+
+
+def test_textbook_text_roundtrip_levels(textbook_pdf):
+    book, _ = extract_pdf(textbook_pdf)
+    b2 = Book.from_text(book.to_text())
+    assert [(c.level, c.title) for c in b2.chapters] == [(c.level, c.title) for c in book.chapters]
+    assert b2.chapters[1].paragraphs[0] == "#### Основные понятия"
+
+
+def test_file_groups_and_m4b_markers(tmp_path, textbook_pdf):
+    from audiobook.pipeline import parse_into_project
+    from audiobook.project import Project
+
+    proj = Project.create(tmp_path / "projects", textbook_pdf, name="Учебник")
+    parse_into_project(proj)
+    by_chapter = [g[0] for g in proj.file_groups(2)]
+    assert by_chapter == [
+        "Глава 1. Предпринимательство и предпринимательское право",
+        "Глава 2. Источники предпринимательского права",
+    ]
+    # раздел «приклеен» к первой главе
+    assert proj.file_groups(2)[0][1] == [0, 1, 2]
+    assert len(proj.file_groups(3)) == 3  # § 1 главы 1 — отдельный файл
+    assert len(proj.file_groups(1)) == 1
+    # подзаголовок «Основные понятия» — отдельный сегмент-заголовок
+    assert any(s.kind == "heading" and s.text == "Основные понятия." for s in proj.segments)

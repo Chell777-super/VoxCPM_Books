@@ -8,6 +8,7 @@ GPU никогда не ждёт диск: синтез идёт в одном �
 from __future__ import annotations
 
 import queue
+import re
 import statistics
 import threading
 import time
@@ -281,21 +282,39 @@ def export_book(
     work = out_dir / "_work"
     work.mkdir(parents=True, exist_ok=True)
 
-    n_ch = len(project.chapter_titles)
+    groups = project.file_groups(opts.split_level)
+    levels = project.chapter_levels or [2] * len(project.chapter_titles)
     chapter_wavs, chapter_titles, durations, outputs = [], [], [], []
-    for ci in range(n_ch):
-        items = [(str(project.seg_path(s)), s.pause_ms) for s in project.chapter_segments(ci) if project.seg_path(s).exists()]
+    all_markers: List[tuple] = []
+    offset = 0.0
+    parent = ""  # «Глава 2» — префикс для меток параграфов, чтобы «§ 1» разных глав различались
+    for gi, (name, cis) in enumerate(groups):
+        items = []
+        for ci in cis:
+            lvl = levels[ci] if ci < len(levels) else 2
+            name_ci = project.chapter_titles[ci]
+            if lvl == 2:
+                parent = re.split(r"[.:]", name_ci, maxsplit=1)[0].strip()[:20]
+            # метка: начало каждой главы уровня <= marker_level (и самой группы)
+            mark = None
+            if lvl <= opts.marker_level or ci == cis[0]:
+                mark = f"{parent} · {name_ci}" if lvl == 3 and parent else name_ci
+            for s in project.chapter_segments(ci):
+                if project.seg_path(s).exists():
+                    items.append((str(project.seg_path(s)), s.pause_ms, mark))
+                    mark = None
         if not items:
             continue
-        name = project.chapter_titles[ci]
-        wav = work / f"{ci + 1:03d}.wav"
+        wav = work / f"{len(chapter_wavs) + 1:03d}.wav"
         if progress:
-            progress(ci / max(1, n_ch), f"Глава {ci + 1}/{n_ch}: {name}")
-        dur = assemble_chapter(items, wav, sr)
+            progress(gi / max(1, len(groups)), f"Файл {gi + 1}/{len(groups)}: {name}")
+        dur, markers = assemble_chapter(items, wav, sr)
         chapter_wavs.append(str(wav))
         chapter_titles.append(name)
         durations.append(dur)
-        log(f"Глава {ci + 1}: {name} — {fmt_duration(dur)}")
+        all_markers += [(m, offset + t) for m, t in markers]
+        offset += dur
+        log(f"{len(chapter_wavs):03d}. {name} — {fmt_duration(dur)}")
         if "mp3" in opts.formats:
             mp3_dir = out_dir / "mp3"
             mp3_dir.mkdir(exist_ok=True)
@@ -307,9 +326,9 @@ def export_book(
         if progress:
             progress(0.95, "Сборка M4B с главами…")
         m4b = out_dir / f"{safe_filename(title)}.m4b"
-        build_m4b(chapter_wavs, chapter_titles, durations, str(m4b), opts, title=title, artist=artist, cover=cover, work_dir=str(work))
+        build_m4b(chapter_wavs, all_markers, offset, str(m4b), opts, title=title, artist=artist, cover=cover, work_dir=str(work))
         outputs.append(str(m4b))
-        log(f"M4B: {m4b.name} ({fmt_duration(sum(durations))})")
+        log(f"M4B: {m4b.name} ({fmt_duration(offset)}, меток глав: {len(all_markers)})")
 
     if "wav" in opts.formats:
         wav_dir = out_dir / "wav"

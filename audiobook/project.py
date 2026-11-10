@@ -104,6 +104,7 @@ class Project:
         self.book: Optional[Book] = None
         self.segments: List[SegState] = []
         self.chapter_titles: List[str] = []
+        self.chapter_levels: List[int] = []
         if (self.root / "project.json").exists():
             self.load()
 
@@ -165,7 +166,11 @@ class Project:
 
     def save_segments(self) -> None:
         with self.lock:
-            data = {"chapters": self.chapter_titles, "segments": [asdict(s) for s in self.segments]}
+            data = {
+                "chapters": self.chapter_titles,
+                "levels": self.chapter_levels,
+                "segments": [asdict(s) for s in self.segments],
+            }
             _atomic_write(self.root / "segments.json", json.dumps(data, ensure_ascii=False))
 
     def load(self) -> None:
@@ -177,6 +182,7 @@ class Project:
             if sp.exists():
                 data = json.loads(sp.read_text("utf-8"))
                 self.chapter_titles = data.get("chapters", [])
+                self.chapter_levels = data.get("levels") or [2] * len(self.chapter_titles)
                 self.segments = [SegState(**s) for s in data.get("segments", [])]
             self.refresh_status()
 
@@ -198,7 +204,8 @@ class Project:
         with self.lock:
             old: Dict[str, SegState] = {s.key: s for s in self.segments}
             self.book = book
-            self.chapter_titles = [c.title or f"Часть {i + 1}" for i, c in enumerate(book.chapters)]
+            self.chapter_titles = [c.title or ("Вступление" if i == 0 else f"Часть {i + 1}") for i, c in enumerate(book.chapters)]
+            self.chapter_levels = [c.level for c in book.chapters]
             vsig = self.voice_signature()
             self.segments = []
             for sg in segments:
@@ -264,6 +271,27 @@ class Project:
 
     def chapter_segments(self, ci: int) -> List[SegState]:
         return [s for s in self.segments if s.chapter == ci]
+
+    def file_groups(self, split_level: int) -> List[tuple]:
+        """Группирует главы в выходные файлы: [(название_файла, [индексы глав])].
+
+        Новый файл начинается с заголовка уровня <= split_level (1 — разделы, 2 — главы,
+        3 — параграфы). Заголовок без собственного текста («Раздел I») приклеивается к
+        следующему файлу: «Раздел I. … Глава 1. …» звучит в начале файла главы 1.
+        """
+        has_body = {ci for ci in range(len(self.chapter_titles)) if any(s.kind == "text" for s in self.chapter_segments(ci))}
+        groups: List[list] = []
+        for ci, title in enumerate(self.chapter_titles):
+            lvl = self.chapter_levels[ci] if ci < len(self.chapter_levels) else 2
+            starts = lvl <= split_level
+            if not groups or (starts and any(c in has_body for c in groups[-1][1])):
+                groups.append([title, [ci], lvl])
+            else:
+                groups[-1][1].append(ci)
+                # Название файла — самый «мелкий» заголовок <= split_level до начала текста
+                if starts and not any(c in has_body for c in groups[-1][1][:-1]):
+                    groups[-1][0] = title
+        return [(t, cis) for t, cis, _ in groups]
 
 
 def list_projects(projects_dir: str | Path) -> List[str]:
