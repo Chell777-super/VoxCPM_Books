@@ -225,6 +225,7 @@ def cmd_pdf2text(a):
         last_page=a.last_page,
         chapter_mode=a.chapters or "auto",
         skip_toc_pages=not a.keep_toc,
+        skip_front_matter=not a.keep_front,
     )
     norm = NormalizeOptions(lang=a.lang or "ru", numbers_to_words=a.numbers)
     if a.replacements:
@@ -322,6 +323,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("-o", "--output", help="файл разметки (для одного входного файла)")
     p.add_argument("--no-speech", action="store_true", help="не писать предпросмотр озвучки")
     p.add_argument("--keep-toc", action="store_true", help="не пропускать страницы оглавления")
+    p.add_argument("--keep-front", action="store_true", help="не пропускать титул/авторов/сокращения до первой главы")
     p.add_argument("--replacements", help="файл словаря замен (строки «что=на что»)")
     parse_opts(p)
     p.set_defaults(func=cmd_pdf2text)

@@ -597,7 +597,7 @@ def test_webui_text_tab(tmp_path, textbook_pdf):
     import audiobook.webui as w
 
     w.S = w.AppState(str(tmp_path / "projects"), "x", False)
-    settings = [1, 0, list(w.CHAPTER_MODES)[0], True, True, True, True, "ru", False, True, 230, 380, 50, True, True, True, ""]
+    settings = [1, 0, list(w.CHAPTER_MODES)[0], True, True, True, True, "ru", False, True, 230, 380, 50, True, True, True, "", True]
     summary, markup, speech, files = w.on_text_process(textbook_pdf, *settings)
     assert "Глава: 2" in summary and len(files) == 2
     out = w.on_text_create_project(markup.replace("Бизнес", "Предпринимательство"), textbook_pdf, "Мой учебник", *settings)
@@ -605,3 +605,149 @@ def test_webui_text_tab(tmp_path, textbook_pdf):
     assert w.S.project.name == "Мой учебник"
     assert w.S.project.cover_path.exists()
     assert any(s.text.startswith("Предпринимательство. Деятельность") for s in w.S.project.segments)
+
+
+# --------------------------------------------------------------------------- #
+# Реальная вёрстка учебника из ЭБС (по прогону пользователя)
+# --------------------------------------------------------------------------- #
+
+
+def _make_real_textbook_pdf(path):
+    pymupdf = pytest.importorskip("pymupdf")
+    if FONT is None or FONT_BOLD is None:
+        pytest.skip("нет TTF-шрифтов")
+    doc = pymupdf.open()
+    W, H, lh = 420, 600, 13
+    fR, fB = pymupdf.Font(fontfile=FONT), pymupdf.Font(fontfile=FONT_BOLD)
+    pno = [16]
+
+    def page(header=True):
+        pg = doc.new_page(width=W, height=H)
+        pg.insert_font(fontname="F", fontfile=FONT)
+        pg.insert_font(fontname="B", fontfile=FONT_BOLD)
+        even = len(doc) % 2 == 0
+        L = 30 if even else 60  # зеркальные поля
+        R = L + 330
+        if header:
+            pno[0] += 1
+            n = str(pno[0])
+            # колонтитул ниже стандартного поля (≈10% высоты), тем же кеглем, что и текст
+            if even:
+                pg.insert_text((L, 62), n, fontsize=9.5, fontname="F")
+                t = "Раздел I. Общие положения"
+                pg.insert_text((R - fR.text_length(t, fontsize=9.5), 62), t, fontsize=9.5, fontname="F")
+            else:
+                t = "Глава 1. Предпринимательство и предпринимательское право"
+                pg.insert_text((L, 62), t, fontsize=9.5, fontname="F")
+                pg.insert_text((R - fR.text_length(n, fontsize=9.5), 62), n, fontsize=9.5, fontname="F")
+        return pg, L, R
+
+    def line(pg, y, s, x, bold=False, size=9.5):
+        pg.insert_text((x, y), s, fontsize=size, fontname="B" if bold else "F")
+        return y + lh
+
+    def center(pg, y, s, L, R, size=9.5, bold=True):
+        f = fB if bold else fR
+        return line(pg, y, s, L + (R - L - f.text_length(s, fontsize=size)) / 2, bold, size)
+
+    def para(pg, y, lines, L):
+        for k, s in enumerate(lines):
+            y = line(pg, y, s, L + (14 if k == 0 else 0))
+        return y
+
+    def definition(pg, y, term, first, rest, L):
+        pg.insert_text((L + 14, y), term, fontsize=9.5, fontname="B")
+        x = L + 14 + fB.text_length(term + " ", fontsize=9.5)
+        pg.insert_text((x, y), first, fontsize=9.5, fontname="F")
+        y += lh
+        for s in rest:
+            y = line(pg, y, s, L)
+        return y
+
+    # 1. титул
+    pg, L, R = page(header=False)
+    for k, s in enumerate(["Предпринимательское", "право", "Российской Федерации"]):
+        center(pg, 150 + k * 30, s, L, R, size=22)
+    center(pg, 260, "Учебник в двух томах", L, R, bold=False)
+    center(pg, 290, "Том 1", L, R, size=16)
+    # 2. выходные данные
+    pg, L, R = page(header=False)
+    line(pg, 80, "УДК 351.824.1(470+571)(075.8)  ББК 67.404.91", L)
+    line(pg, 100, "ISBN 978-5-00156- (Норма)", L)
+    line(pg, 120, "Рецензенты: Ю. Г. Лескова, доктор юридических наук.", L)
+    # 3. оглавление: точки есть, номер страницы — отдельной строкой справа
+    pg, L, R = page(header=False)
+    y = center(pg, 70, "Оглавление", L, R) + 8
+    for s, n in [
+        ("Список сокращений ……………………………………", "12"),
+        ("Предисловие ……………………………………………", "16"),
+        ("Глава 1. Предпринимательство и предпринимательское право …", "18"),
+        ("§ 1. Понятие предпринимательства ………………………", "20"),
+        ("Глава 2. Источники предпринимательского права ………", "78"),
+    ]:
+        line(pg, y, s, L)
+        line(pg, y, n, R - fR.text_length(n, fontsize=9.5))
+        y += lh
+    # 4. список сокращений
+    pg, L, R = page()
+    y = center(pg, 100, "Список сокращений", L, R) + 8
+    y = para(pg, y, ["ГК РФ — Гражданский кодекс Российской Федерации"], L)
+    # 5. предисловие
+    pg, L, R = page()
+    y = center(pg, 100, "Предисловие", L, R) + 8
+    y = para(pg, y, [
+        "Изучение правового регулирования — насущная необходимость",
+        "как для юриста, так и для предпринимателя. Нормы носят публично-",
+        "правовой характер, а публично-правовые начала важны.",
+    ], L)
+    # 6. Раздел I + Глава 1 + глоссарий (все строки — с отступом-«определением»)
+    pg, L, R = page(header=False)
+    y = center(pg, 110, "Раздел I. Общие положения", L, R, size=12) + 14
+    y = center(pg, y, "Глава 1. Предпринимательство", L, R, size=11)
+    y = center(pg, y, "и предпринимательское право", L, R, size=11) + 12
+    y = center(pg, y, "Основные понятия", L, R) + 4
+    y = definition(pg, y, "Бизнес —", "деятельность, осуществляемая", ["субъектами предпринимательства по извлечению благ."], L)
+    y = definition(pg, y, "Правовая категория", "— понятие, используемое для обозна-", ["чения отдельных правовых явлений."], L)
+    y = definition(pg, y, "Правовая система", "— юридическая практи-", ["ка (правоприменительная и юрисдикционная)."], L)
+    y = definition(pg, y, "Предпринимательский риск", "— возможность", ["убытков из-за нарушения контрагентами пред-"], L)
+    # 7. продолжение определения после колонтитула «Глава 1. … 19»
+    pg, L, R = page()
+    y = para(pg, 90, ["принимателя своих обязательств или изменения условий."], L)
+    y = center(pg, y + 10, "Основные нормативные акты", L, R) + 4
+    y = para(pg, y, ["Конституция РФ."], L)
+    y = para(pg, y, ["Гражданский кодекс РФ."], L)
+    doc.save(path)
+    doc.close()
+
+
+@pytest.fixture()
+def real_textbook_pdf(tmp_path):
+    p = tmp_path / "real.pdf"
+    _make_real_textbook_pdf(str(p))
+    return str(p)
+
+
+def test_real_textbook_layout(real_textbook_pdf):
+    book, rep = extract_pdf(real_textbook_pdf)
+    got = [(c.level, c.title) for c in book.chapters]
+    # титул, «Том 1», выходные данные, оглавление и список сокращений — пропущены
+    assert got == [
+        (2, "Предисловие"),
+        (1, "Раздел I. Общие положения"),
+        (2, "Глава 1. Предпринимательство и предпринимательское право"),
+    ], got
+    text = "\n".join(p for c in book.chapters for p in c.paragraphs)
+    assert "ISBN" not in text and "……" not in text and "Гражданский кодекс Российской" not in text
+    # колонтитулы (ниже стандартного поля, тем же кеглем) удалены и не вклеены в текст
+    assert "Глава 1. Предпринимательство и предпринимательское право" not in text
+    assert "Общие положения" not in text
+    assert "контрагентами предпринимателя своих обязательств" in text
+    # переносы
+    assert "публично-правовой характер" in text  # слово с дефисом встречается в документе
+    assert "юридическая практика (правоприменительная" in text  # «-ка» — не частица
+    # подзаголовки и определения при зеркальных полях
+    paras = book.chapters[2].paragraphs
+    assert paras[0] == "#### Основные понятия"
+    assert paras[1].startswith("**Бизнес** — деятельность")
+    assert paras[2].startswith("**Правовая категория** — понятие, используемое для обозначения")
+    assert "#### Основные нормативные акты" in paras

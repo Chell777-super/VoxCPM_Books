@@ -58,11 +58,17 @@ HEADING_RE = re.compile(
 ROMAN_OR_NUM_RE = re.compile(r"^\s*(?:[IVXLCDM]{1,8}|\d{1,3})\s*\.?\s*$")
 SCENE_BREAK_RE = re.compile(r"^\s*(?:[*⁂✻✱•·#~]\s*){1,5}$|^\s*[-–—]{3,}\s*$")
 PAGE_NUM_RE = re.compile(r"^\s*(?:[-–—]\s*)?(?:стр\.?|с\.|page|p\.)?\s*\d{1,4}\s*(?:[-–—]\s*)?$", re.I)
-TOC_LEADER_RE = re.compile(r"(?:\.\s*){4,}\s*\d{1,4}\s*$|…{2,}\s*\d{1,4}\s*$")
+TOC_LEADER_RE = re.compile(r"(?:\.\s*){4,}\s*\d{0,4}\s*$|…{2,}\.*\s*\d{0,4}\s*$")
 SENT_END_RE = re.compile(r"[.!?…][»\"”’)\]]*\s*$")
 _HYPHENS = "-‐‑­"
 # Частицы, перед которыми дефис настоящий: кто-то, где-нибудь, скажи-ка, всё-таки
-_KEEP_HYPHEN_RE = re.compile(r"^(?:то|либо|нибудь|ка|таки|де|с|тка|кась)(?![а-яё])", re.I)
+_KEEP_HYPHEN_RE = re.compile(r"^(?:то|либо|нибудь|таки)(?![а-яё])", re.I)
+# Перед -то/-либо/-нибудь — местоимения и наречия: кто-то, где-нибудь, какой-либо, всё-таки
+_PRONOUN_STEM_RE = re.compile(
+    r"(?:^|[^а-яё])(?:кто|что|чего|чему|чем|ком|где|куда|откуда|когда|как|какой|какая|какое|какие|каких|каким|какую|"
+    r"какого|какому|чей|чья|чьё|чьи|сколько|зачем|почему|отчего|кое|всё|все|так|опять|довольно|наконец|[а-яё]+(?:ой|ая|ое|ие|ых|им|ую|ого|ому|ем|ей|ий))$",
+    re.I,
+)
 
 _LIGATURES = {
     "ﬀ": "ff",
@@ -83,9 +89,13 @@ _LIGATURES = {
 _LIG_RE = re.compile("|".join(map(re.escape, _LIGATURES)))
 
 
-def clean_raw(s: str) -> str:
+def clean_raw(s: str, keep_soft_hyphen: bool = False) -> str:
     s = unicodedata.normalize("NFC", s)
-    return _LIG_RE.sub(lambda m: _LIGATURES[m.group(0)], s)
+    s = _LIG_RE.sub(lambda m: _LIGATURES[m.group(0)], s)
+    s = s.replace("\u2011", "-").replace("\u2010", "-")  # неразрывный дефис → обычный
+    if not keep_soft_hyphen:
+        s = s.replace("\u00ad", "")
+    return s
 
 
 def ends_sentence(s: str) -> bool:
@@ -156,6 +166,7 @@ class ExtractOptions:
     toc_level: int = 3
     skip_toc_pages: bool = True  # выкидывать страницы оглавления
     skip_service_pages: bool = True  # УДК/ББК/ISBN/© — выходные данные
+    skip_front_matter: bool = True  # всё до «Предисловия/Введения/Раздела/Главы» (титул, авторы, сокращения)
     margin_ratio: float = 0.085  # доля высоты страницы, считающаяся полем
 
 
@@ -165,6 +176,7 @@ class ExtractReport:
     removed_headers: int = 0
     removed_footnotes: int = 0
     removed_pages: int = 0
+    skipped_front_items: int = 0
     chapter_source: str = ""
     warnings: List[str] = field(default_factory=list)
 
@@ -212,7 +224,8 @@ def _read_lines(doc, page_numbers: Iterable[int]) -> List[Line]:
                     sizes[round(s["size"], 1)] += n
                     if s.get("flags", 0) & 16 or "bold" in s.get("font", "").lower():
                         bold_chars += n
-                text = clean_raw("".join(parts))
+                text = clean_raw("".join(parts), keep_soft_hyphen=True)
+                text = re.sub("\u00ad(?=.)", "", text)  # мягкий перенос внутри строки не нужен
                 # надстрочные цифры-маркеры сносок: «слово¹» → «слово»
                 text = re.sub(r"(?<=[^\W\d_]|[.,;:!?»…])[¹²³⁴⁵⁶⁷⁸⁹⁰]+", "", text)
                 if not text.strip():
@@ -275,30 +288,67 @@ def _norm_key(s: str) -> str:
     return re.sub(r"\s+", " ", s).strip(" .-–—")
 
 
+def _edge_rows(lines: List[Line]) -> dict:
+    """Индексы строк верхнего и нижнего ряда каждой страницы + зазор до соседнего ряда."""
+    by_page = defaultdict(list)
+    for i, ln in enumerate(lines):
+        by_page[ln.page].append(i)
+    res = {}
+    for _, idxs in by_page.items():
+        idxs = sorted(idxs, key=lambda i: lines[i].y0)
+        if len(idxs) < 3:
+            continue
+        top_y, bot_y = lines[idxs[0]].y0, lines[idxs[-1]].y0
+        top = [i for i in idxs if lines[i].y0 - top_y < 0.5 * lines[i].size]
+        bot = [i for i in idxs if bot_y - lines[i].y0 < 0.5 * lines[i].size]
+        rest_top = [i for i in idxs if i not in top]
+        rest_bot = [i for i in idxs if i not in bot]
+        gap_top = (lines[rest_top[0]].y0 - max(lines[i].y1 for i in top)) if rest_top else 0
+        gap_bot = (min(lines[i].y0 for i in bot) - max(lines[i].y1 for i in rest_bot)) if rest_bot else 0
+        for i in top:
+            res[i] = ("top", gap_top)
+        for i in bot:
+            res[i] = ("bottom", gap_bot)
+    return res
+
+
 def _remove_headers(lines: List[Line], opts: ExtractOptions, rep: ExtractReport) -> List[Line]:
-    in_margin = []
-    for ln in lines:
+    """Колонтитулы и номера страниц.
+
+    Кандидаты — строки в полях страницы ИЛИ самый верхний/нижний ряд страницы (у книг из
+    электронных библиотек колонтитул часто стоит ниже стандартного поля). Удаляем, если это
+    номер страницы, колонтитул с номером в той же строке («20 Раздел I…», «Глава 1… 19»)
+    или строка, повторяющаяся в этом положении на нескольких страницах.
+    """
+    body = _body_size(lines)
+    edges = _edge_rows(lines)
+    cand = []
+    for i, ln in enumerate(lines):
         top = ln.y1 < ln.page_h * opts.margin_ratio
         bottom = ln.y0 > ln.page_h * (1 - opts.margin_ratio)
-        in_margin.append(top or bottom)
+        cand.append(top or bottom or i in edges)
 
     pages_by_key = defaultdict(set)
-    for ln, m in zip(lines, in_margin):
-        if m:
+    for ln, c in zip(lines, cand):
+        if c:
             pages_by_key[_norm_key(ln.text)].add(ln.page)
 
     n_pages = len({ln.page for ln in lines}) or 1
     min_repeat = 3 if n_pages >= 6 else max(2, n_pages // 2 + 1)
 
     out = []
-    for ln, m in zip(lines, in_margin):
-        if m:
+    for i, (ln, c) in enumerate(zip(lines, cand)):
+        if c:
             key = _norm_key(ln.text)
-            if PAGE_NUM_RE.match(ln.text):
+            in_margin = ln.y1 < ln.page_h * opts.margin_ratio or ln.y0 > ln.page_h * (1 - opts.margin_ratio)
+            pos, gap = edges.get(i, ("", 0.0))
+            h = max(ln.y1 - ln.y0, ln.size)
+            # отделён от текста (интервал/линейка), мелкий шрифт или в стандартном поле
+            separated = in_margin or ln.size < body * 0.97 or gap > 0.9 * h
+            if PAGE_NUM_RE.match(ln.text) and (separated or pos):
                 rep.removed_headers += 1
                 continue
-            # «20  Раздел I. Общие положения», «Глава 1. … право  19» — колонтитул с номером страницы
-            if NUM_EDGE_RE.match(ln.text) and not ends_sentence(ln.text):
+            if NUM_EDGE_RE.match(ln.text) and not ends_sentence(ln.text) and separated:
                 rep.removed_headers += 1
                 continue
             if key and len(pages_by_key[key]) >= min_repeat and (not ends_sentence(ln.text) or key == "#"):
@@ -325,7 +375,8 @@ def _remove_pages(lines: List[Line], opts: ExtractOptions, rep: ExtractReport) -
             continue
         if first_heading_page is None and any(heading_level(l.text) for l in ls):
             first_heading_page = p
-        if opts.skip_service_pages and first_heading_page is None and any(SERVICE_PAGE_RE.search(l.text) for l in ls):
+        early = p - min(by_page) < max(6, 0.08 * len(by_page))
+        if opts.skip_service_pages and (first_heading_page is None or early) and any(SERVICE_PAGE_RE.search(l.text) for l in ls):
             drop.add(p)
     rep.removed_pages += len(drop)
     return [ln for ln in lines if ln.page not in drop]
@@ -354,19 +405,23 @@ def _remove_footnotes(lines: List[Line], body: float, rep: ExtractReport) -> Lis
 # --------------------------------------------------------------------------- #
 
 
-def _centered(ln: Line, left: Optional[float] = None) -> bool:
-    """Строка выровнена по центру (а не просто короткая строка с абзацным отступом)."""
-    sym = abs((ln.x0 + ln.x1) / 2 - ln.page_w / 2) < ln.page_w * 0.06
-    narrow = (ln.x1 - ln.x0) < ln.page_w * 0.75
+def _centered(ln: Line, left: Optional[float] = None, right: Optional[float] = None) -> bool:
+    """Строка выровнена по центру текстового блока (у книг поля зеркальные — центр листа не подходит)."""
+    if left is not None and right is not None and right - left > ln.page_w * 0.3:
+        mid, width = (left + right) / 2, right - left
+    else:
+        mid, width = ln.page_w / 2, ln.page_w
+    sym = abs((ln.x0 + ln.x1) / 2 - mid) < width * 0.07
+    narrow = (ln.x1 - ln.x0) < width * 0.85
     if left is not None:
         # отступ слева заметно больше абзацного (≈ 1–1.5 em)
         return sym and narrow and ln.x0 - left > 2.2 * max(ln.size, 1.0)
     return sym and narrow
 
 
-def _styled(ln: Line, body: float, left: Optional[float] = None) -> bool:
+def _styled(ln: Line, body: float, left: Optional[float] = None, right: Optional[float] = None) -> bool:
     """Строка оформлена как заголовок: жирная, крупнее, или по центру."""
-    return ln.bold or ln.size >= body * 1.1 or _centered(ln, left)
+    return ln.bold or ln.size >= body * 1.1 or _centered(ln, left, right)
 
 
 def _gap_above(lines: List[Line], i: int) -> float:
@@ -379,7 +434,7 @@ def _gap_above(lines: List[Line], i: int) -> float:
 def _mark_headings(lines: List[Line], body: float, use_font: bool, use_regex: bool) -> None:
     margins = _page_margins(lines)
     for i, ln in enumerate(lines):
-        left = margins.get(ln.page, (None, None))[0]
+        left, right = margins.get(ln.page, (None, None))
         t = ln.text
         if ln.kind == "heading":
             continue
@@ -391,7 +446,7 @@ def _mark_headings(lines: List[Line], body: float, use_font: bool, use_regex: bo
         big = ln.size >= body * 1.18
         lvl = heading_level(t) if use_regex else 0
         # Строка «Глава 1 ГК РФ …» внутри абзаца — не заголовок: требуем оформления
-        if lvl and (_styled(ln, body, left) or _isolated(lines, i)):
+        if lvl and (_styled(ln, body, left, right) or _isolated(lines, i)):
             ln.kind, ln.level = "heading", lvl
         elif use_font and big and len(t) <= 100 and not TOC_LEADER_RE.search(t):
             ln.kind, ln.level = "heading", heading_level(t) or 2
@@ -404,7 +459,7 @@ def _mark_headings(lines: List[Line], body: float, use_font: bool, use_regex: bo
             and ln.bold
             and len(t) <= 90
             and not ends_sentence(t)
-            and (_centered(ln, left) or NUMBERED_SUB_RE.match(t))
+            and (_centered(ln, left, right) or NUMBERED_SUB_RE.match(t))
             and _gap_above(lines, i) > 0.3 * body
         ):
             ln.kind = "subheading"  # «Основные понятия», «1.1. Основные положения»
@@ -496,37 +551,76 @@ def _apply_toc(doc, lines: List[Line], level: int) -> bool:
 # --------------------------------------------------------------------------- #
 
 
+# Слова с дефисом, встречающиеся в документе внутри строк («публично-правовых», «из-за»):
+# если такое слово разорвано переносом, дефис сохраняется. Заполняется в extract_pdf.
+_DOC_HYPHEN_WORDS: set = set()
+
+
 def join_lines(a: str, b: str) -> str:
     """Склейка двух строк с корректной обработкой переносов."""
     if not a:
         return b
     if not b:
         return a
-    if a[-1] == "­":
+    if a[-1] == "\u00ad":
         return a[:-1] + b
     if a[-1] in _HYPHENS and len(a) >= 2 and a[-2].isalpha():
         first = b[0]
         if first.isalpha() and first.islower():
-            if _KEEP_HYPHEN_RE.match(b):
-                return a[:-1] + "-" + b
+            left = re.search(r"([^\W\d_]+)-$", a)
+            right = re.match(r"[^\W\d_]+", b)
+            if left and right and _hyphen_key(left.group(1), right.group(0)) in _DOC_HYPHEN_WORDS:
+                return a + b  # «публично-» + «правовых» → «публично-правовых»
+            if _KEEP_HYPHEN_RE.match(b) and left and _PRONOUN_STEM_RE.search(left.group(1)):
+                return a + b  # «кто-» + «то» → «кто-то»
             return a[:-1] + b
         return a + b  # «северо-Западный», «1990-х»: оставляем дефис
     return a + " " + b
 
 
+def _hyphen_key(left: str, right: str) -> tuple:
+    """Ключ по основе: «публично-правовой» и «публично-правовые» → ("публично", "прав")."""
+    return left.lower(), right.lower()[:4]
+
+
+def _collect_hyphen_words(lines: List["Line"]) -> set:
+    words = set()
+    for ln in lines:
+        # не берём дефис в самом конце строки — это перенос
+        for m in re.finditer(r"(?<![\w-])([^\W\d_]{2,}-[^\W\d_]{2,})(?![\w-])", ln.text[:-1] if ln.text.endswith("-") else ln.text):
+            a, b = m.group(1).split("-", 1)
+            words.add(_hyphen_key(a, b))
+    return words
+
+
 def _page_margins(lines: List[Line]):
-    """Левая граница текста и правая граница (90-й перцентиль) для каждой страницы."""
+    """Левая и правая граница текстового блока для каждой страницы.
+
+    Считаем по всему документу отдельно для чётных и нечётных страниц (у книг поля
+    зеркальные): левая граница — самый частый x0 строк основного текста (большинство строк
+    без абзацного отступа), правая — 95-й перцентиль x1. Если страниц мало — по самой странице.
+    """
+    groups = defaultdict(list)
     by_page = defaultdict(list)
     for ln in lines:
-        if ln.kind == "text":
+        if ln.kind == "text" and len(ln.text) > 25:
+            groups[ln.page % 2].append(ln)
             by_page[ln.page].append(ln)
-    res = {}
-    for p, ls in by_page.items():
-        xs0 = sorted(round(l.x0) for l in ls)
+
+    def calc(ls):
+        xs0 = Counter(round(l.x0) for l in ls)
         xs1 = sorted(l.x1 for l in ls)
-        left = Counter(xs0).most_common(1)[0][0]
-        right = xs1[int(len(xs1) * 0.9)] if len(xs1) > 2 else xs1[-1]
-        res[p] = (left, right)
+        left = xs0.most_common(1)[0][0]
+        right = xs1[min(len(xs1) - 1, int(len(xs1) * 0.95))]
+        return left, right
+
+    parity = {k: calc(v) for k, v in groups.items() if len(v) >= 30}
+    res = {}
+    for p in {ln.page for ln in lines}:
+        if p % 2 in parity:
+            res[p] = parity[p % 2]
+        elif by_page.get(p):
+            res[p] = calc(by_page[p])
     return res
 
 
@@ -593,6 +687,23 @@ def _build(lines: List[Line], body: float) -> List[tuple]:
     return [tuple(x) for x in items]
 
 
+FRONT_START_RE = re.compile(
+    r"^\s*(?:предисловие|введение|вступление|от автора|от редактора|вместо предисловия|пролог|раздел|часть|глава|"
+    r"preface|foreword|introduction|prologue|part|chapter)\b",
+    re.IGNORECASE,
+)
+
+
+def _skip_front_matter(items: List[tuple]) -> tuple:
+    """Отрезает титул, выходные данные, «Сведения об авторах», «Список сокращений» и т.п.:
+    всё до первого заголовка вида «Предисловие/Введение/Раздел/Часть/Глава»."""
+    limit = max(10, len(items) // 3)  # ищем только в начале книги
+    for k, (kind, text, _lvl) in enumerate(items[:limit]):
+        if kind == "heading" and FRONT_START_RE.match(text):
+            return items[k:], k
+    return items, 0
+
+
 def _to_book(items: List[tuple], split_chapters: bool) -> List[Chapter]:
     chapters: List[Chapter] = []
     for kind, text, level in items:
@@ -641,6 +752,8 @@ def extract_pdf(path: str, opts: Optional[ExtractOptions] = None) -> tuple[Book,
             return Book(title=doc.metadata.get("title") or "", source=path), rep
 
         body = _body_size(lines)
+        _DOC_HYPHEN_WORDS.clear()
+        _DOC_HYPHEN_WORDS.update(_collect_hyphen_words(lines))
         lines = _remove_pages(lines, opts, rep)
         if opts.remove_headers:
             lines = _remove_headers(lines, opts, rep)
@@ -670,6 +783,9 @@ def extract_pdf(path: str, opts: Optional[ExtractOptions] = None) -> tuple[Book,
             rep.chapter_source = "без разбиения"
 
         items = _build(lines, body)
+        if opts.skip_front_matter:
+            items, skipped = _skip_front_matter(items)
+            rep.skipped_front_items = skipped
         chapters = _to_book(items, split_chapters=mode != "none")
 
         # Слишком много «глав» — признак ложных срабатываний по шрифту
@@ -679,6 +795,16 @@ def extract_pdf(path: str, opts: Optional[ExtractOptions] = None) -> tuple[Book,
                 "Попробуйте режим «шаблоны» или «оглавление»."
             )
 
+        if opts.remove_headers and rep.pages >= 20 and rep.removed_headers < rep.pages // 10:
+            rep.warnings.append(
+                "Колонтитулы почти не найдены — проверьте в предпросмотре, не вклеились ли строки вида "
+                "«Глава 1. … 19» в текст. Если да — пришлите пример, подстроим."
+            )
+        if rep.skipped_front_items:
+            rep.warnings.append(
+                f"Пропущено начало книги до первого раздела/главы/предисловия ({rep.skipped_front_items} блоков: "
+                "титул, авторы, сокращения…). Нужно оставить — снимите галочку «Пропускать начало книги»."
+            )
         meta = doc.metadata or {}
         book = Book(
             title=(meta.get("title") or "").strip(),

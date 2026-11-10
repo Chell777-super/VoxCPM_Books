@@ -131,7 +131,7 @@ def _segments_table(limit: int = 400, only_problems: bool = False):
 
 def _opts_from_values(
     first_page, last_page, chapter_mode, rm_headers, rm_foot, skip_toc, skip_service, lang, numbers, abbr, target, maxc, minc,
-    titles, merge, mark_defs=True, replacements="",
+    titles, merge, mark_defs=True, replacements="", skip_front=True,
 ):
     extract = ExtractOptions(
         first_page=int(first_page or 1),
@@ -141,6 +141,7 @@ def _opts_from_values(
         chapter_mode=CHAPTER_MODES.get(chapter_mode, "auto"),
         skip_toc_pages=bool(skip_toc),
         skip_service_pages=bool(skip_service),
+        skip_front_matter=bool(skip_front),
     )
     normalize = NormalizeOptions(
         lang=lang, numbers_to_words=bool(numbers), expand_abbreviations=bool(abbr), replacements=replacements or ""
@@ -306,6 +307,7 @@ def _parse_ui_values():
         e.first_page, e.last_page or 0, mode, e.remove_headers, e.remove_footnotes, e.skip_toc_pages,
         e.skip_service_pages, n.lang, n.numbers_to_words, n.expand_abbreviations, g.target_chars, g.max_chars,
         g.min_chars, g.read_chapter_titles, g.merge_short_paragraphs, g.mark_definitions, n.replacements,
+        e.skip_front_matter,
     ]
 
 
@@ -604,6 +606,10 @@ def build_ui() -> gr.Blocks:
             rm_foot = gr.Checkbox(label="Удалять сноски", value=True)
             skip_toc = gr.Checkbox(label="Пропускать страницы оглавления", value=True)
             skip_service = gr.Checkbox(label="Пропускать выходные данные (УДК, ББК, ISBN, ©)", value=True)
+            skip_front = gr.Checkbox(
+                label="Пропускать начало книги до «Предисловия / Введения / Раздела / Главы» (титул, авторы, сокращения)",
+                value=True,
+            )
             lang = gr.Radio(label="Язык", choices=["ru", "en"], value="ru")
             numbers = gr.Checkbox(label="Числа → слова (обычно не нужно, модель читает цифры сама)", value=False)
             abbr = gr.Checkbox(label="Раскрывать сокращения (т. е., и т. д., см. …)", value=True)
@@ -666,7 +672,7 @@ def build_ui() -> gr.Blocks:
             with gr.Accordion("Сегменты (первые 400)", open=False):
                 segs_df = gr.Dataframe(headers=["#", "Гл.", "", "Симв.", "Текст", "Заметка"], value=_segments_table(), interactive=False, wrap=True)
 
-        parse_settings = [first_page, last_page, chapter_mode, rm_headers, rm_foot, skip_toc, skip_service, lang, numbers, abbr, target, maxc, minc, titles, merge, mark_defs, replacements]
+        parse_settings = [first_page, last_page, chapter_mode, rm_headers, rm_foot, skip_toc, skip_service, lang, numbers, abbr, target, maxc, minc, titles, merge, mark_defs, replacements, skip_front]
         parse_out = [parse_msg, chapters_df, segs_df, book_text, status_md, proj_dd]
 
         # ------------------------------------------------------------ Голос

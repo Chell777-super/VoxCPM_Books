@@ -53,6 +53,14 @@ _RU_ABBR = [
     (r"\b(в|во)\s+п\.\s?(?=\d)", r"\1 пункте "),
     (r"\bподп\.\s?(?=\d)", "подпункт "),
     (r"\bп\.\s?(?=\d)", "пункт "),
+    (r"\bгреч\.", "от греческого"),
+    (r"\bлат\.", "от латинского"),
+    (r"\bангл\.", "от английского"),
+    (r"\bфранц\.", "от французского"),
+    (r"\bнем\.", "от немецкого"),
+    (r"\bк\.\s?ю\.\s?н\.", "кандидат юридических наук"),
+    (r"\bд\.\s?ю\.\s?н\.", "доктор юридических наук"),
+    (r"\bим\.\s?(?=[А-ЯЁ])", "имени "),
     (r"№\s?", "номер "),
     (r"§\s?", "параграф "),
 ]
@@ -132,7 +140,10 @@ def _expand_units(text: str) -> str:
         word = _RU_UNITS[unit]
         prep = (m.group("prep") or "")
         p = prep.strip().lower()
-        if unit == "г" and p in _YEAR_CASE:
+        before = m.string[max(0, m.start() - 14):m.start()]
+        if unit == "г" and re.search(r"(?:января|февраля|марта|апреля|мая|июня|июля|августа|сентября|октября|ноября|декабря)\s*$", before, re.I):
+            word = "года"  # «от 2 декабря 1990 г.» → «года»
+        elif unit == "г" and p in _YEAR_CASE:
             word = _YEAR_CASE[p]
         elif unit == "в" and p in ("в", "во"):
             word = "веке"
@@ -258,6 +269,8 @@ def normalize_text(text: str, opts: NormalizeOptions | None = None) -> str:
     t = _user_replacements(text, opts.replacements)
 
     t = _URL_RE.sub(" ", t)
+    # фонетическая транскрипция (præksiˈɒlədʒi) — модель её не прочитает
+    t = re.sub(r"\S*[æɒəʃʒθðŋɪʊʌɔɛɑˈˌː]\S*", " ", t)
     if opts.remove_footnote_refs:
         t = _FOOTREF_RE.sub("", t)
 
