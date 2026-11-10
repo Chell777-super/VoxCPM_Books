@@ -15,14 +15,15 @@ import numpy as np
 import soundfile as sf
 
 from .audio import ExportOptions, fmt_duration, postprocess
-from .book import LEVEL_NAMES, Book
+from .book import LEVEL_NAMES, Book, safe_filename
 from .engine import EngineConfig, SynthConfig, TTSEngine, VoiceConfig
 from .normalize import NormalizeOptions, normalize_text
-from .pdf_extract import ExtractOptions
+from .pdf_extract import ExtractOptions, render_cover
 from .pipeline import SynthesisJob, export_book, parse_into_project
 from .project import Project, list_projects
 from .segmenter import SegmentOptions, estimate_duration_sec
 from .voices import check_reference, list_voices, load_voice, save_voice
+from .textproc import process_file, process_markup, write_outputs
 
 PRESETS = {"Быстро (черновик)": 6, "Баланс (рекомендуется)": 10, "Качество": 16}
 CHAPTER_MODES = {
@@ -128,13 +129,11 @@ def _segments_table(limit: int = 400, only_problems: bool = False):
     return rows
 
 
-def _settings_from_ui(
+def _opts_from_values(
     first_page, last_page, chapter_mode, rm_headers, rm_foot, skip_toc, skip_service, lang, numbers, abbr, target, maxc, minc,
     titles, merge, mark_defs=True, replacements="",
 ):
-    p = _need_project()
-    st = p.settings
-    st.extract = ExtractOptions(
+    extract = ExtractOptions(
         first_page=int(first_page or 1),
         last_page=int(last_page) if last_page else None,
         remove_headers=bool(rm_headers),
@@ -143,17 +142,71 @@ def _settings_from_ui(
         skip_toc_pages=bool(skip_toc),
         skip_service_pages=bool(skip_service),
     )
-    st.normalize = NormalizeOptions(
+    normalize = NormalizeOptions(
         lang=lang, numbers_to_words=bool(numbers), expand_abbreviations=bool(abbr), replacements=replacements or ""
     )
-    maxc = max(int(maxc), int(target) + 20)
-    st.segment = SegmentOptions(
+    segment = SegmentOptions(
         target_chars=int(target),
-        max_chars=maxc,
+        max_chars=max(int(maxc), int(target) + 20),
         min_chars=int(minc),
         read_chapter_titles=bool(titles),
         merge_short_paragraphs=bool(merge),
         mark_definitions=bool(mark_defs),
+    )
+    return extract, normalize, segment
+
+
+def _settings_from_ui(*values):
+    p = _need_project()
+    p.settings.extract, p.settings.normalize, p.settings.segment = _opts_from_values(*values)
+
+
+def _tp_outputs(res, stem: str):
+    out_dir = Path(tempfile.mkdtemp(prefix="voxbooks_text_"))
+    files = write_outputs(res, out_dir / f"{stem} — разметка.txt", out_dir / f"{stem} — озвучка.txt")
+    summary = "\n".join(f"- {line}" for line in res.summary.splitlines())
+    for w in res.warnings:
+        summary += f"\n- ⚠ {w}"
+    return summary, res.markup, res.speech, files
+
+
+def on_text_process(file, *settings):
+    if not file:
+        raise gr.Error("Загрузите PDF или TXT.")
+    extract, normalize, segment = _opts_from_values(*settings)
+    t0 = time.time()
+    res = process_file(file, extract, segment, normalize)
+    summary, markup, speech, files = _tp_outputs(res, safe_filename(Path(file).stem, 60))
+    return f"**Готово за {time.time() - t0:.1f} с**\n\n" + summary, markup, speech, files
+
+
+def on_text_refresh(markup, file, *settings):
+    if not (markup or "").strip():
+        raise gr.Error("Нет текста — сначала обработайте файл.")
+    _, normalize, segment = _opts_from_values(*settings)
+    stem = safe_filename(Path(file).stem, 60) if file else "текст"
+    res = process_markup(markup, segment, normalize, default_title=stem)
+    summary, markup, speech, files = _tp_outputs(res, stem)
+    return "**Предпросмотр обновлён по правленому тексту**\n\n" + summary, speech, files
+
+
+def on_text_create_project(markup, file, name, *settings):
+    if S.busy:
+        raise gr.Error("Идёт озвучка — сначала остановите её.")
+    if not (markup or "").strip():
+        raise gr.Error("Нет текста — сначала обработайте файл.")
+    stem = (name or "").strip() or (Path(file).stem if file else "Книга")
+    tmp = Path(tempfile.mkdtemp(prefix="voxbooks_text_")) / f"{safe_filename(stem, 60)}.txt"
+    tmp.write_text(markup, encoding="utf-8")
+    S.project = Project.create(S.projects_dir, str(tmp), name=stem)
+    _settings_from_ui(*settings)
+    if file and str(file).lower().endswith(".pdf"):
+        render_cover(str(file), str(S.project.cover_path))
+    book = Book.from_text(markup, default_title=stem)
+    info = parse_into_project(S.project, book=book, log=S._log)
+    return _parse_outputs(
+        f"✅ Проект «{S.project.name}» создан из размеченного текста: глав {info['chapters']}, сегментов {info['total']}. "
+        "Дальше — вкладка «Голос»."
     )
 
 
@@ -542,6 +595,55 @@ def build_ui() -> gr.Blocks:
             open_btn = gr.Button("📂 Открыть", scale=1)
             refresh_btn = gr.Button("🔄", scale=0, min_width=50)
         status_md = gr.Markdown(_project_status_md())
+        with gr.Accordion("⚙ Настройки разбора текста (для вкладок «Текст из PDF» и «Книга»)", open=False):
+            with gr.Row():
+                first_page = gr.Number(label="С страницы", value=1, precision=0)
+                last_page = gr.Number(label="По страницу (0 = до конца)", value=0, precision=0)
+            chapter_mode = gr.Dropdown(label="Главы", choices=list(CHAPTER_MODES), value=list(CHAPTER_MODES)[0])
+            rm_headers = gr.Checkbox(label="Удалять колонтитулы и номера страниц", value=True)
+            rm_foot = gr.Checkbox(label="Удалять сноски", value=True)
+            skip_toc = gr.Checkbox(label="Пропускать страницы оглавления", value=True)
+            skip_service = gr.Checkbox(label="Пропускать выходные данные (УДК, ББК, ISBN, ©)", value=True)
+            lang = gr.Radio(label="Язык", choices=["ru", "en"], value="ru")
+            numbers = gr.Checkbox(label="Числа → слова (обычно не нужно, модель читает цифры сама)", value=False)
+            abbr = gr.Checkbox(label="Раскрывать сокращения (т. е., и т. д., см. …)", value=True)
+            target = gr.Slider(120, 400, value=230, step=10, label="Целевая длина сегмента, симв.")
+            maxc = gr.Slider(200, 600, value=380, step=10, label="Максимальная длина сегмента, симв.")
+            minc = gr.Slider(10, 120, value=50, step=5, label="Минимальная длина (короткие реплики объединяются)")
+            titles = gr.Checkbox(label="Читать названия глав", value=True)
+            merge = gr.Checkbox(label="Объединять короткие абзацы-реплики", value=True)
+            mark_defs = gr.Checkbox(
+                label="Определения «**Термин** — текст»: пауза после термина", value=True
+            )
+            replacements = gr.Textbox(
+                label="Словарь замен (строка «что=на что»)",
+                lines=4,
+                placeholder="ГК РФ=Гражданский кодекс Российской Федерации\nНК РФ=Налоговый кодекс Российской Федерации",
+            )
+
+
+        # ---------------------------------------------------- Текст из PDF
+        with gr.Tab("0 · Текст из PDF"):
+            gr.Markdown(
+                "Только обработка текста — без модели и видеокарты. Загрузите PDF/TXT и получите **разметку** "
+                "(`#` раздел, `##` глава, `###` §, `####` подзаголовок, `**термин**` — определение) и "
+                "**предпросмотр озвучки**: текст ровно так, как его прочитает модель, с фрагментами и паузами. "
+                "Разметку можно поправить прямо здесь и создать из неё проект."
+            )
+            with gr.Row():
+                with gr.Column(scale=1):
+                    tp_file = gr.File(label="PDF или TXT", file_types=[".pdf", ".txt", ".md"], type="filepath")
+                    tp_btn = gr.Button("🔎 Обработать", variant="primary")
+                    tp_summary = gr.Markdown()
+                    tp_files = gr.File(label="Скачать", file_count="multiple", interactive=False)
+                    tp_name = gr.Textbox(label="Название проекта", placeholder="по умолчанию — имя файла")
+                    tp_create_btn = gr.Button("📥 Создать проект из этого текста")
+                with gr.Column(scale=2):
+                    with gr.Tab("Разметка (можно править)"):
+                        tp_markup = gr.Textbox(lines=26, max_lines=40, show_label=False)
+                        tp_refresh_btn = gr.Button("↻ Обновить предпросмотр по правленому тексту")
+                    with gr.Tab("Как прочитает модель"):
+                        tp_speech = gr.Textbox(lines=28, max_lines=40, show_label=False, interactive=False)
 
         # ------------------------------------------------------------ Книга
         with gr.Tab("1 · Книга"):
@@ -549,31 +651,6 @@ def build_ui() -> gr.Blocks:
                 with gr.Column(scale=1):
                     file_in = gr.File(label="PDF или TXT", file_types=[".pdf", ".txt", ".md"], type="filepath")
                     name_in = gr.Textbox(label="Название проекта (необязательно)")
-                    with gr.Accordion("Настройки разбора", open=False):
-                        with gr.Row():
-                            first_page = gr.Number(label="С страницы", value=1, precision=0)
-                            last_page = gr.Number(label="По страницу (0 = до конца)", value=0, precision=0)
-                        chapter_mode = gr.Dropdown(label="Главы", choices=list(CHAPTER_MODES), value=list(CHAPTER_MODES)[0])
-                        rm_headers = gr.Checkbox(label="Удалять колонтитулы и номера страниц", value=True)
-                        rm_foot = gr.Checkbox(label="Удалять сноски", value=True)
-                        skip_toc = gr.Checkbox(label="Пропускать страницы оглавления", value=True)
-                        skip_service = gr.Checkbox(label="Пропускать выходные данные (УДК, ББК, ISBN, ©)", value=True)
-                        lang = gr.Radio(label="Язык", choices=["ru", "en"], value="ru")
-                        numbers = gr.Checkbox(label="Числа → слова (обычно не нужно, модель читает цифры сама)", value=False)
-                        abbr = gr.Checkbox(label="Раскрывать сокращения (т. е., и т. д., см. …)", value=True)
-                        target = gr.Slider(120, 400, value=230, step=10, label="Целевая длина сегмента, симв.")
-                        maxc = gr.Slider(200, 600, value=380, step=10, label="Максимальная длина сегмента, симв.")
-                        minc = gr.Slider(10, 120, value=50, step=5, label="Минимальная длина (короткие реплики объединяются)")
-                        titles = gr.Checkbox(label="Читать названия глав", value=True)
-                        merge = gr.Checkbox(label="Объединять короткие абзацы-реплики", value=True)
-                        mark_defs = gr.Checkbox(
-                            label="Определения «**Термин** — текст»: пауза после термина", value=True
-                        )
-                        replacements = gr.Textbox(
-                            label="Словарь замен (строка «что=на что»)",
-                            lines=4,
-                            placeholder="ГК РФ=Гражданский кодекс Российской Федерации\nНК РФ=Налоговый кодекс Российской Федерации",
-                        )
                     create_btn = gr.Button("📥 Создать проект и разобрать", variant="primary")
                     with gr.Row():
                         reparse_btn = gr.Button("♻ Перераспределить сегменты")
@@ -695,6 +772,9 @@ def build_ui() -> gr.Blocks:
 
         # ----------------------------------------------------------- События
         refresh_btn.click(lambda: gr.update(choices=list_projects(S.projects_dir)), outputs=proj_dd)
+        tp_btn.click(on_text_process, inputs=[tp_file] + parse_settings, outputs=[tp_summary, tp_markup, tp_speech, tp_files])
+        tp_refresh_btn.click(on_text_refresh, inputs=[tp_markup, tp_file] + parse_settings, outputs=[tp_summary, tp_speech, tp_files])
+        tp_create_btn.click(on_text_create_project, inputs=[tp_markup, tp_file, tp_name] + parse_settings, outputs=parse_out)
         open_btn.click(on_open, inputs=proj_dd, outputs=parse_out + voice_inputs + parse_settings)
         create_btn.click(on_create, inputs=[file_in, name_in] + parse_settings, outputs=parse_out)
         reparse_btn.click(on_resegment, inputs=parse_settings, outputs=parse_out)

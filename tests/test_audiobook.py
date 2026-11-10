@@ -551,3 +551,57 @@ def test_legal_abbreviations(src, expected):
 def test_user_replacements():
     t = normalize_text("Нормы ГК РФ.", NormalizeOptions(replacements="ГК РФ=Гражданского кодекса"))
     assert t == "Нормы Гражданского кодекса."
+
+
+# --------------------------------------------------------------------------- #
+# Обработка текста: PDF → разметка + предпросмотр озвучки
+# --------------------------------------------------------------------------- #
+
+
+def test_text_processing(textbook_pdf):
+    from audiobook.textproc import process_file, process_markup
+
+    res = process_file(textbook_pdf)
+    m = res.markup
+    assert "# Раздел I. Общие положения" in m
+    assert "## Глава 1. Предпринимательство и предпринимательское право" in m
+    assert "### § 1. Понятие предпринимательства и предпринимательской деятельности" in m
+    assert "#### Основные понятия" in m
+    assert "**Бизнес** — деятельность" in m
+    assert "ISBN" not in m and "....." not in m
+    sp = res.speech
+    assert "Бизнес. Деятельность, осуществляемая" in sp
+    assert "⏸ 0.70 с" in sp and "⏸ 2.50 с" in sp
+    assert "Раздел: 1, Глава: 2, §: 2" in res.summary
+    # правленая разметка → тот же результат + правки
+    res2 = process_markup(m.replace("Бизнес", "Бизнес-деятельность"))
+    assert "Бизнес-деятельность. Деятельность" in res2.speech
+    assert [(c.level, c.title) for c in res2.book.chapters][:3] == [(c.level, c.title) for c in res.book.chapters][:3]
+
+
+def test_cli_pdf2text(tmp_path, textbook_pdf):
+    import shutil
+
+    from audiobook.cli import main
+
+    src = tmp_path / "Учебник.pdf"
+    shutil.copy(textbook_pdf, src)
+    main(["pdf2text", str(src)])
+    markup = tmp_path / "Учебник — разметка.txt"
+    speech = tmp_path / "Учебник — озвучка.txt"
+    assert markup.exists() and speech.exists()
+    assert "## Глава 2. Источники предпринимательского права" in markup.read_text(encoding="utf-8")
+
+
+def test_webui_text_tab(tmp_path, textbook_pdf):
+    import audiobook.webui as w
+
+    w.S = w.AppState(str(tmp_path / "projects"), "x", False)
+    settings = [1, 0, list(w.CHAPTER_MODES)[0], True, True, True, True, "ru", False, True, 230, 380, 50, True, True, True, ""]
+    summary, markup, speech, files = w.on_text_process(textbook_pdf, *settings)
+    assert "Глава: 2" in summary and len(files) == 2
+    out = w.on_text_create_project(markup.replace("Бизнес", "Предпринимательство"), textbook_pdf, "Мой учебник", *settings)
+    assert "создан" in out[0]
+    assert w.S.project.name == "Мой учебник"
+    assert w.S.project.cover_path.exists()
+    assert any(s.text.startswith("Предпринимательство. Деятельность") for s in w.S.project.segments)

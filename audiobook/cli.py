@@ -213,6 +213,35 @@ def cmd_voices(a):
         print(f"{n:30s} {'Hi-Fi' if v.hifi else '     '}  {v.transcript[:60]}")
 
 
+def cmd_pdf2text(a):
+    """PDF/TXT → размеченный текст (+ предпросмотр озвучки). Без модели и GPU."""
+    from .normalize import NormalizeOptions
+    from .pdf_extract import ExtractOptions
+    from .segmenter import SegmentOptions
+    from .textproc import process_file, write_outputs
+
+    ex = ExtractOptions(
+        first_page=a.first_page or 1,
+        last_page=a.last_page,
+        chapter_mode=a.chapters or "auto",
+        skip_toc_pages=not a.keep_toc,
+    )
+    norm = NormalizeOptions(lang=a.lang or "ru", numbers_to_words=a.numbers)
+    if a.replacements:
+        norm.replacements = Path(a.replacements).read_text(encoding="utf-8")
+    seg = SegmentOptions()
+    for f in a.files:
+        src = Path(f)
+        res = process_file(str(src), ex, seg, norm)
+        out = Path(a.output) if a.output and len(a.files) == 1 else src.with_name(src.stem + " — разметка.txt")
+        speech = None if a.no_speech else out.with_name(src.stem + " — озвучка.txt")
+        for path in write_outputs(res, out, speech):
+            print(path)
+        print(res.summary)
+        for w in res.warnings:
+            print("⚠ " + w)
+
+
 def cmd_ui(a):
     from .webui import launch
 
@@ -287,6 +316,15 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("status", help="состояние проекта")
     p.add_argument("project")
     p.set_defaults(func=cmd_status)
+
+    p = sub.add_parser("pdf2text", help="PDF → размеченный текст и предпросмотр озвучки (без модели)")
+    p.add_argument("files", nargs="+")
+    p.add_argument("-o", "--output", help="файл разметки (для одного входного файла)")
+    p.add_argument("--no-speech", action="store_true", help="не писать предпросмотр озвучки")
+    p.add_argument("--keep-toc", action="store_true", help="не пропускать страницы оглавления")
+    p.add_argument("--replacements", help="файл словаря замен (строки «что=на что»)")
+    parse_opts(p)
+    p.set_defaults(func=cmd_pdf2text)
 
     p = sub.add_parser("voice-add", help="добавить голос в библиотеку (образец + точный текст = Hi-Fi)")
     p.add_argument("name")
