@@ -62,7 +62,7 @@ class AppState:
         return self.job is not None and self.job.state.running
 
 
-S: AppState  # инициализируется в launch()
+S: "AppState" = None  # type: ignore  # инициализируется в launch()
 
 
 # --------------------------------------------------------------------------- #
@@ -479,7 +479,8 @@ def build_ui() -> gr.Blocks:
     with gr.Blocks(title="VoxCPM Books") as demo:
         gr.Markdown("# 📚 VoxCPM Books — аудиокниги из PDF\nVoxCPM2 · 48 кГц · клонирование и дизайн голоса")
         with gr.Row():
-            proj_dd = gr.Dropdown(label="Проекты", choices=list_projects(S.projects_dir), scale=3)
+            _projects = list_projects(S.projects_dir)
+            proj_dd = gr.Dropdown(label="Проекты", choices=_projects, value=_projects[0] if _projects else None, scale=3)
             open_btn = gr.Button("📂 Открыть", scale=1)
             refresh_btn = gr.Button("🔄", scale=0, min_width=50)
         status_md = gr.Markdown(_project_status_md())
@@ -628,6 +629,17 @@ def build_ui() -> gr.Blocks:
         problems_btn.click(lambda: _segments_table(limit=1000, only_problems=True), outputs=problems_df)
 
         export_btn.click(on_export, inputs=[formats, mp3_br, aac_br, out_sr, allow_missing], outputs=[export_files, export_log, export_msg])
+
+        # При запуске открываем последний проект (если есть)
+        def _autoload(name):
+            if name and S.project is None and not S.busy:
+                try:
+                    return on_open(name)
+                except Exception:
+                    pass
+            return [gr.update()] * (len(parse_out) + len(voice_inputs))
+
+        demo.load(_autoload, inputs=proj_dd, outputs=parse_out + voice_inputs)
 
         timer = gr.Timer(2.0)
         timer.tick(on_tick, outputs=[progress_html, log_box, status_md])

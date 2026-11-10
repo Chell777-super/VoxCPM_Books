@@ -31,7 +31,7 @@ def _make_book_pdf(path):
         pytest.skip("нет TTF-шрифта с кириллицей")
     doc = pymupdf.open()
     W, H = 420, 600
-    L, R = 50, 370
+    L = 50
     body = 11
     lh = 15
 

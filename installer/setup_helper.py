@@ -117,8 +117,8 @@ def cmd_check():
     except Exception:
         print("· triton не найден — будет eager-режим (работает, но медленнее)")
     try:
-        import fitz  # noqa: F401
         import gradio
+        import pymupdf  # noqa: F401
         import razdel  # noqa: F401
 
         print(f"gradio {gradio.__version__}, PyMuPDF, razdel — ок")
