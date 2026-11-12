@@ -176,6 +176,12 @@ def cmd_synth(a):
 
 def cmd_export(a):
     proj = _open_project(a.project, a.projects_dir)
+    if getattr(a, "preset", None) == "iphone":
+        from .audio import iphone_preset
+
+        proj.settings.export = iphone_preset(proj.settings.export)
+    if getattr(a, "max_part_mb", None) is not None:
+        proj.settings.export.max_part_mb = a.max_part_mb
     if a.formats:
         proj.settings.export.formats = tuple(x.strip() for x in a.formats.split(",") if x.strip())
     if a.bitrate:
@@ -305,6 +311,8 @@ def build_parser() -> argparse.ArgumentParser:
         p.add_argument("--allow-missing", action="store_true")
         p.add_argument("--split-by", choices=["part", "chapter", "section"], help="файлы по разделам/главам/§ (по умолч. главам)")
         p.add_argument("--marks-by", choices=["part", "chapter", "section"], help="метки в M4B (по умолч. §)")
+        p.add_argument("--preset", choices=["iphone"], help="iphone: M4B AAC 96k моно 44.1 кГц, метки по §, части ≤ 1.9 ГБ")
+        p.add_argument("--max-part-mb", type=int, help="делить M4B на части до N МБ (0 — одним файлом)")
 
     p = sub.add_parser("new", help="создать проект из PDF/TXT")
     p.add_argument("file")

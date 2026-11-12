@@ -18,7 +18,16 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, List, Optional
 
-from .audio import ExportOptions, assemble_chapter, build_m4b, encode_mp3, fmt_duration, postprocess, write_segment
+from .audio import (
+    ExportOptions,
+    assemble_chapter,
+    build_m4b,
+    encode_mp3,
+    estimate_m4b_mb,
+    fmt_duration,
+    postprocess,
+    write_segment,
+)
 from .book import Book, safe_filename
 from .engine import SynthConfig, TTSEngine
 from .pdf_extract import extract_any, render_cover
@@ -284,6 +293,43 @@ class SynthesisJob:
 # --------------------------------------------------------------------------- #
 
 
+def plan_m4b_parts(durations: List[float], sections: List[str], max_mb: int, aac_bitrate: str) -> List[List[int]]:
+    """Делит файлы-группы на части M4B не больше max_mb (по оценке размера).
+
+    Режем только между группами (§/главами — середину § не разрываем). Если в набираемой части
+    во второй её половине начался новый раздел — режем по границе раздела: так части осмысленнее.
+    Группа, которая одна больше лимита, становится отдельной частью.
+    """
+    idx = list(range(len(durations)))
+    if not max_mb or max_mb <= 0 or estimate_m4b_mb(sum(durations), aac_bitrate) <= max_mb:
+        return [idx] if idx else []
+    parts: List[List[int]] = []
+    cur: List[int] = []
+    for i in idx:
+        if cur and estimate_m4b_mb(sum(durations[j] for j in cur + [i]), aac_bitrate) > max_mb:
+            # граница раздела во второй половине текущей части?
+            cut = None
+            half = sum(durations[j] for j in cur) / 2
+            acc = 0.0
+            for k, j in enumerate(cur):
+                if k > 0 and sections[j] != sections[cur[k - 1]] and acc >= half:
+                    cut = k
+                acc += durations[j]
+            if cut:
+                parts.append(cur[:cut])
+                cur = cur[cut:]
+                if estimate_m4b_mb(sum(durations[j] for j in cur + [i]), aac_bitrate) > max_mb:
+                    parts.append(cur)
+                    cur = []
+            else:
+                parts.append(cur)
+                cur = []
+        cur.append(i)
+    if cur:
+        parts.append(cur)
+    return parts
+
+
 def export_book(
     project: Project,
     opts: Optional[ExportOptions] = None,
@@ -330,11 +376,15 @@ def export_book(
     # Папки: mp3/01 Раздел …/02 Глава …/003 § ….mp3 (уровни выше split_level)
     folder = {1: None, 2: None}  # текущие папки раздела и главы
     counters = {1: 0, 2: 0, 3: 0}
+    section = ""  # текущий раздел — для деления M4B на части по границам разделов
+    wav_sections: List[str] = []
     for gi, (name, cis) in enumerate(groups):
         items = []
         for ci in cis:
             lvl = levels[ci] if ci < len(levels) else 2
             name_ci = project.chapter_titles[ci]
+            if lvl == 1:
+                section = name_ci
             if hierarchical and lvl in (1, 2) and lvl < opts.split_level:
                 counters[lvl] += 1
                 folder[lvl] = f"{counters[lvl]:02d} {safe_filename(name_ci, 40)}"
@@ -359,6 +409,7 @@ def export_book(
         chapter_wavs.append(str(wav))
         chapter_titles.append(name)
         durations.append(dur)
+        wav_sections.append(section)
         all_markers += [(m, offset + t) for m, t in markers]
         offset += dur
         log(f"{len(chapter_wavs):03d}. {name} — {fmt_duration(dur)}")
@@ -377,10 +428,28 @@ def export_book(
     if "m4b" in opts.formats and chapter_wavs:
         if progress:
             progress(0.95, "Сборка M4B с главами…")
-        m4b = out_dir / f"{safe_filename(title)}.m4b"
-        build_m4b(chapter_wavs, all_markers, offset, str(m4b), opts, title=title, artist=artist, cover=cover, work_dir=str(work))
-        outputs.append(str(m4b))
-        log(f"M4B: {m4b.name} ({fmt_duration(offset)}, меток глав: {len(all_markers)})")
+        parts = plan_m4b_parts(durations, wav_sections, opts.max_part_mb, opts.aac_bitrate)
+        starts = [sum(durations[:i]) for i in range(len(durations) + 1)]
+        n = len(parts)
+        for pi, idx in enumerate(parts, 1):
+            p0, p1 = starts[idx[0]], starts[idx[-1] + 1]
+            # метки этой части, со сдвигом на её начало
+            marks = [(m, t - p0) for m, t in all_markers if p0 - 1e-6 <= t < p1 - 1e-6]
+            if not marks or marks[0][1] > 0.05:  # часть начинается с середины главы — метка в начале
+                marks.insert(0, (chapter_titles[idx[0]], 0.0))
+            if n == 1:
+                m4b = out_dir / f"{safe_filename(title)}.m4b"
+                part_title, track = title, None
+            else:
+                m4b = out_dir / f"{safe_filename(title, 50)} ({pi} из {n}).m4b"
+                part_title, track = f"{title}, часть {pi} из {n}", f"{pi}/{n}"
+            build_m4b(
+                [chapter_wavs[i] for i in idx], marks, p1 - p0, str(m4b), opts,
+                title=part_title, album=title, artist=artist, cover=cover, work_dir=str(work), track=track,
+            )
+            outputs.append(str(m4b))
+            size = m4b.stat().st_size / 1e6
+            log(f"M4B: {m4b.name} ({fmt_duration(p1 - p0)}, {size:.0f} МБ, меток: {len(marks)})")
 
     if "wav" in opts.formats:
         wav_dir = out_dir / "wav"

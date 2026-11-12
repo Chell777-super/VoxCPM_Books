@@ -14,7 +14,7 @@ import gradio as gr
 import numpy as np
 import soundfile as sf
 
-from .audio import ExportOptions, fmt_duration, postprocess
+from .audio import ExportOptions, fmt_duration, iphone_preset, postprocess
 from .book import LEVEL_NAMES, Book, safe_filename
 from .engine import EngineConfig, SynthConfig, TTSEngine, VoiceConfig
 from .normalize import NormalizeOptions, normalize_text
@@ -558,14 +558,41 @@ def on_mark_ok(idx):
 SPLIT_LEVELS = {"Разделам": 1, "Главам": 2, "Параграфам (§)": 3}
 
 
-def on_export(formats, split_by, marks_by, mp3_br, aac_br, sr, folders, allow_missing, progress=gr.Progress()):
+FMT_M4B = "M4B (одним файлом, с главами)"
+IPHONE_HINT = (
+    "📱 **Как закинуть на iPhone.** Самое простое — **BookPlayer** (бесплатный, App Store):\n"
+    "1. Отправьте `.m4b` себе в Telegram → «Избранное» (или положите в iCloud Drive).\n"
+    "2. На iPhone откройте файл → «Поделиться» → **BookPlayer**.\n\n"
+    "Главы (§) и обложка видны в плеере; позиция запоминается. Если частей несколько — "
+    "закиньте все, BookPlayer покажет их по порядку."
+)
+
+
+def on_export_iphone(allow_missing, progress=gr.Progress()):
+    """Пресет «Для iPhone»: M4B AAC 96k моно 44.1 кГц, метки по §, части до 1.9 ГБ (лимит Telegram)."""
+    opts = iphone_preset(S.project.settings.export if S.project else None)
+    outs, log, msg = on_export(
+        [FMT_M4B], "Параграфам (§)", "Параграфам (§)", "320k", opts.aac_bitrate, str(opts.sample_rate),
+        True, allow_missing, opts.max_part_mb, progress=progress,
+    )
+    ui = (
+        gr.update(value=[FMT_M4B]),
+        gr.update(value="Параграфам (§)"),
+        gr.update(value=opts.aac_bitrate),
+        gr.update(value=str(opts.sample_rate)),
+        gr.update(value=opts.max_part_mb),
+    )
+    return (outs, log, msg + "\n\n" + IPHONE_HINT) + ui
+
+
+def on_export(formats, split_by, marks_by, mp3_br, aac_br, sr, folders, allow_missing, max_part_mb=0, progress=gr.Progress()):
     p = _need_project()
     if S.busy:
         raise gr.Error("Дождитесь окончания озвучки или остановите её.")
     fm = []
     if "MP3 (отдельные файлы)" in formats:
         fm.append("mp3")
-    if "M4B (одним файлом, с главами)" in formats:
+    if FMT_M4B in formats:
         fm.append("m4b")
     if "WAV (отдельные файлы)" in formats:
         fm.append("wav")
@@ -579,6 +606,7 @@ def on_export(formats, split_by, marks_by, mp3_br, aac_br, sr, folders, allow_mi
         split_level=SPLIT_LEVELS.get(split_by, 2),
         marker_level=SPLIT_LEVELS.get(marks_by, 3),
         folders=bool(folders),
+        max_part_mb=int(max_part_mb or 0),
     )
     p.save()
     logs = []
@@ -773,8 +801,15 @@ def build_ui() -> gr.Blocks:
                 aac_br = gr.Dropdown(label="Битрейт AAC (M4B)", choices=["96k", "128k", "192k", "256k"], value="256k")
                 out_sr = gr.Dropdown(label="Частота", choices=["48000", "44100", "24000"], value="48000")
             folders = gr.Checkbox(label="Раскладывать MP3 по папкам: Раздел / Глава / файлы §", value=True)
+            max_part = gr.Number(
+                label="Делить M4B на части до, МБ (0 — одним файлом; Telegram: 1900, Telegram Premium: 3900)",
+                value=0,
+                precision=0,
+            )
             allow_missing = gr.Checkbox(label="Собрать, даже если не все сегменты озвучены", value=False)
-            export_btn = gr.Button("📦 Собрать аудиокнигу", variant="primary")
+            with gr.Row():
+                export_btn = gr.Button("📦 Собрать аудиокнигу", variant="primary", scale=2)
+                iphone_btn = gr.Button("📱 Для iPhone (M4B 96k, части ≤ 1.9 ГБ)", scale=1)
             export_files = gr.File(label="Результат", file_count="multiple")
             export_log = gr.Textbox(label="Журнал сборки", lines=8)
             export_msg = gr.Markdown()
@@ -810,7 +845,16 @@ def build_ui() -> gr.Blocks:
         save_seg_btn.click(on_save_segment_text, inputs=[seg_idx, seg_text], outputs=[job_msg, segs_df])
         problems_btn.click(lambda: _segments_table(limit=1000, only_problems=True), outputs=problems_df)
 
-        export_btn.click(on_export, inputs=[formats, split_by, marks_by, mp3_br, aac_br, out_sr, folders, allow_missing], outputs=[export_files, export_log, export_msg])
+        export_btn.click(
+            on_export,
+            inputs=[formats, split_by, marks_by, mp3_br, aac_br, out_sr, folders, allow_missing, max_part],
+            outputs=[export_files, export_log, export_msg],
+        )
+        iphone_btn.click(
+            on_export_iphone,
+            inputs=[allow_missing],
+            outputs=[export_files, export_log, export_msg, formats, marks_by, aac_br, out_sr, max_part],
+        )
 
         # При запуске открываем последний проект (если есть)
         def _autoload(name):

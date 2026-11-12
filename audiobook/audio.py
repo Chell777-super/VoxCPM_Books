@@ -123,6 +123,48 @@ def _run_ffmpeg(args: List[str]) -> None:
         raise RuntimeError("ffmpeg: " + proc.stderr.decode("utf-8", "replace")[-2000:])
 
 
+def _run_ffmpeg_pcm(wav_paths: Sequence[str], args: List[str]) -> None:
+    """Запускает ffmpeg, подавая звук из WAV-файлов «сырым» PCM s16le через stdin.
+
+    Зачем: ffmpeg из Ubuntu (6.1) при чтении WAV ищет в PCM-данных поток S/PDIF и на некоторых
+    наших файлах ошибочно принимает их за MPEG-аудио («mp1») — длительность и звук портятся.
+    С явным форматом входа (-f s16le) ничего не угадывается. Заодно не нужен concat-список.
+    Вход 0 — этот поток; в args нумерация дополнительных входов (-i …) начинается с 1.
+    """
+    ff = find_ffmpeg()
+    if not ff:
+        raise RuntimeError("ffmpeg не найден. Установите пакет imageio-ffmpeg или добавьте ffmpeg в PATH.")
+    if not wav_paths:
+        raise ValueError("нет аудио для кодирования")
+    sr = sf.info(str(wav_paths[0])).samplerate
+    kwargs = {}
+    if sys.platform == "win32":
+        kwargs["creationflags"] = 0x08000000  # CREATE_NO_WINDOW
+    cmd = [ff, "-hide_banner", "-loglevel", "error", "-y", "-f", "s16le", "-ar", str(sr), "-ac", "1", "-i", "pipe:0", *args]
+    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, **kwargs)
+    err_chunks: List[bytes] = []
+
+    import threading
+
+    t = threading.Thread(target=lambda: err_chunks.append(proc.stderr.read()), daemon=True)
+    t.start()
+    try:
+        for p in wav_paths:
+            with sf.SoundFile(str(p)) as f:
+                if f.samplerate != sr or f.channels != 1:
+                    raise RuntimeError(f"{p}: ожидалось моно {sr} Гц")
+                for block in f.blocks(blocksize=sr * 10, dtype="int16"):
+                    proc.stdin.write(np.ascontiguousarray(block).tobytes())
+        proc.stdin.close()
+    except BrokenPipeError:
+        pass
+    finally:
+        rc = proc.wait()
+        t.join(timeout=5)
+    if rc != 0:
+        raise RuntimeError("ffmpeg: " + b"".join(err_chunks).decode("utf-8", "replace")[-2000:])
+
+
 def _meta_escape(s: str) -> str:
     for ch in ("\\", "=", ";", "#", "\n"):
         s = s.replace(ch, "\\" + ch)
@@ -144,6 +186,41 @@ class ExportOptions:
     split_level: int = 3  # файлы по: 1 — разделам, 2 — главам, 3 — параграфам
     marker_level: int = 3  # метки глав в M4B до этого уровня
     folders: bool = True  # MP3 по папкам: Раздел / Глава / файлы §
+    max_part_mb: int = 0  # делить M4B на части не больше N МБ (0 — одним файлом)
+    preset: str = ""
+
+
+# Лимиты пересылки: Telegram без Premium — 2 ГБ, с Premium — 4 ГБ (берём с запасом)
+TELEGRAM_PART_MB = 1900
+TELEGRAM_PREMIUM_PART_MB = 3900
+
+
+def iphone_preset(opts: Optional[ExportOptions] = None) -> ExportOptions:
+    """M4B для iPhone (BookPlayer / Apple Books): AAC 96 кбит/с моно 44.1 кГц (~43 МБ на час —
+    для речи на слух без потерь), метки по каждому §, части до 1.9 ГБ (влезают в Telegram)."""
+    base = opts or ExportOptions()
+    return ExportOptions(
+        formats=("m4b",),
+        mp3_bitrate=base.mp3_bitrate,
+        aac_bitrate="96k",
+        sample_rate=44100,
+        target_db=base.target_db,
+        split_level=base.split_level,
+        marker_level=3,
+        folders=base.folders,
+        max_part_mb=TELEGRAM_PART_MB,
+        preset="iphone",
+    )
+
+
+def bitrate_kbps(b: str) -> float:
+    b = str(b).strip().lower()
+    return float(b[:-1]) if b.endswith("k") else float(b) / 1000
+
+
+def estimate_m4b_mb(duration_sec: float, aac_bitrate: str) -> float:
+    """Оценка размера M4B: аудио + ~2 % на контейнер, метки и обложку."""
+    return duration_sec * bitrate_kbps(aac_bitrate) * 1000 / 8 / 1e6 * 1.02 + 0.5
 
 
 def assemble_chapter(
@@ -188,7 +265,7 @@ def encode_mp3(
     track: Optional[int] = None,
     cover: Optional[str] = None,
 ) -> None:
-    args = ["-i", wav_path]
+    args = []
     if cover and os.path.exists(cover):
         args += ["-i", cover, "-map", "0:a", "-map", "1:v", "-c:v", "mjpeg", "-disposition:v", "attached_pic"]
     # CBR + -compression_level 0 = LAME -q 0 (самый тщательный кодер, максимальное качество)
@@ -200,7 +277,7 @@ def encode_mp3(
             args += ["-metadata", f"{k}={v}"]
     if track is not None:
         args += ["-metadata", f"track={track}"]
-    _run_ffmpeg(args + [out_path])
+    _run_ffmpeg_pcm([wav_path], args + [out_path])
 
 
 def build_m4b(
@@ -213,22 +290,24 @@ def build_m4b(
     artist: str = "",
     cover: Optional[str] = None,
     work_dir: Optional[str] = None,
+    album: str = "",
+    track: Optional[str] = None,
 ) -> None:
-    """Склеивает WAV-файлы в M4B. markers — [(название, начало_с)] от начала книги."""
+    """Склеивает WAV-файлы в M4B. markers — [(название, начало_с)] от начала файла."""
     work = Path(work_dir or Path(out_path).parent)
-    lst = work / "_concat.txt"
     meta = work / "_chapters.txt"
-    with open(lst, "w", encoding="utf-8") as f:
-        for p in chapter_wavs:
-            safe = str(Path(p).resolve()).replace("\\", "/").replace("'", "'\\''")
-            f.write(f"file '{safe}'\n")
     with open(meta, "w", encoding="utf-8") as f:
         f.write(";FFMETADATA1\n")
         if title:
-            f.write(f"title={_meta_escape(title)}\nalbum={_meta_escape(title)}\n")
+            f.write(f"title={_meta_escape(title)}\n")
+        if album or title:
+            f.write(f"album={_meta_escape(album or title)}\n")
         if artist:
-            f.write(f"artist={_meta_escape(artist)}\n")
+            f.write(f"artist={_meta_escape(artist)}\nalbum_artist={_meta_escape(artist)}\n")
+        if track:
+            f.write(f"track={_meta_escape(track)}\n")
         f.write("genre=Audiobook\n")
+        f.write("media_type=2\n")  # тег stik=Audiobook: Apple Books/BookPlayer видят аудиокнигу, а не музыку
         ms = sorted(markers, key=lambda m: m[1])
         for k, (name, start) in enumerate(ms):
             end = ms[k + 1][1] if k + 1 < len(ms) else total_duration
@@ -236,7 +315,7 @@ def build_m4b(
                 continue
             f.write(f"\n[CHAPTER]\nTIMEBASE=1/1000\nSTART={int(round(start * 1000))}\nEND={int(round(end * 1000))}\n")
             f.write(f"title={_meta_escape(name)}\n")
-    args = ["-f", "concat", "-safe", "0", "-i", str(lst), "-i", str(meta)]
+    args = ["-i", str(meta)]
     has_cover = bool(cover and os.path.exists(cover))
     if has_cover:
         args += ["-i", cover]
@@ -246,9 +325,9 @@ def build_m4b(
     args += ["-c:a", "aac", "-b:a", opts.aac_bitrate, "-ar", str(opts.sample_rate), "-ac", "1"]
     args += ["-movflags", "+faststart", "-f", "mp4", out_path]
     try:
-        _run_ffmpeg(args)
+        _run_ffmpeg_pcm(list(chapter_wavs), args)
     finally:
-        for p in (lst, meta):
+        for p in (meta,):
             try:
                 p.unlink()
             except OSError:

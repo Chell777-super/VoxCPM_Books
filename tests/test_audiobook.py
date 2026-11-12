@@ -850,3 +850,104 @@ def test_nano_pipeline_batch(tmp_path, textbook_pdf):
     assert all(s.status == "done" and proj.seg_path(s).exists() for s in proj.segments)
     assert fake.max_active > 1
     assert 0 < job.state.rtf < 1
+
+
+# --------------------------------------------------------------------------- #
+# Пресет «Для iPhone»: M4B 96k, части под лимит Telegram, тег «аудиокнига»
+# --------------------------------------------------------------------------- #
+
+
+def test_plan_m4b_parts():
+    from audiobook.pipeline import plan_m4b_parts
+
+    # 96k ≈ 0.0122 МБ/с; по 300 с ≈ 3.7 МБ на группу
+    d = [300.0] * 8
+    sec = ["A", "A", "A", "B", "B", "B", "C", "C"]
+    assert plan_m4b_parts(d, sec, 0, "96k") == [list(range(8))]  # без деления
+    assert plan_m4b_parts(d, sec, 1000, "96k") == [list(range(8))]  # влезает целиком
+    parts = plan_m4b_parts(d, sec, 12, "96k")  # ≈ 3 группы на часть
+    assert sum(parts, []) == list(range(8))  # ничего не потеряно и порядок сохранён
+    assert all(p for p in parts) and len(parts) >= 3
+    assert parts[0] == [0, 1, 2]  # режем по границе раздела A|B
+    assert plan_m4b_parts([5000.0, 10.0], ["A", "A"], 10, "96k") == [[0], [1]]  # огромная группа — отдельной частью
+
+
+def _ffprobe_text(path):
+    import subprocess
+
+    import imageio_ffmpeg
+
+    return subprocess.run([imageio_ffmpeg.get_ffmpeg_exe(), "-hide_banner", "-i", str(path)], capture_output=True, text=True).stderr
+
+
+def _voice_all_segments(proj, seconds=0.3):
+    import soundfile as sf
+
+    sr = 48000
+    for s in proj.segments:
+        n = int(sr * seconds)
+        sf.write(str(proj.seg_path(s)), (0.1 * np.sin(np.arange(n) / sr * 2 * np.pi * 200)).astype(np.float32), sr)
+    proj.refresh_status()
+
+
+def test_iphone_preset_export_parts(tmp_path, textbook_pdf):
+    pytest.importorskip("imageio_ffmpeg")
+    from audiobook.audio import iphone_preset
+    from audiobook.pipeline import export_book, parse_into_project
+    from audiobook.project import Project
+
+    proj = Project.create(tmp_path / "projects", textbook_pdf, name="Учебник")
+    parse_into_project(proj)
+    _voice_all_segments(proj, seconds=3.0)
+    opts = iphone_preset()
+    assert opts.formats == ("m4b",) and opts.aac_bitrate == "96k" and opts.sample_rate == 44100
+    assert opts.max_part_mb == 1900 and opts.marker_level == 3
+
+    # одним файлом (книга маленькая — в лимит влезает)
+    logs = []
+    outs = export_book(proj, opts, log=logs.append)
+    assert len(outs) == 1 and outs[0].endswith("Учебник.m4b")
+    info = _ffprobe_text(outs[0])
+    assert "media_type      : 2" in info  # stik = Audiobook
+    assert "44100 Hz, mono" in info
+    # длительность файла = длительности собранного аудио (регрессия: ffmpeg 6.1 принимал WAV за «mp1»)
+    m = re.search(r"\((\d+):(\d+)", next(line for line in logs if line.startswith("M4B:")))
+    expected = int(m.group(1)) * 60 + int(m.group(2))
+    h, mi, se = re.search(r"Duration: (\d+):(\d+):([\d.]+)", info).groups()
+    assert abs(int(h) * 3600 + int(mi) * 60 + float(se) - expected) < 1.5
+    br = int(re.search(r"Audio: aac.*?(\d+) kb/s", info).group(1))
+    assert 40 <= br <= 110  # ≤ 96 кбит/с (на простом тестовом тоне AAC-кодер берёт меньше)
+    assert "Chapter #0:2" in info  # метки по §
+
+    # крошечный лимит → несколько частей, у каждой метки с нуля и «часть i из N»
+    opts.max_part_mb = 1
+    outs = export_book(proj, opts, log=lambda m: None)
+    m4bs = [o for o in outs if o.endswith(".m4b")]
+    assert len(m4bs) >= 2 and "(1 из " in m4bs[0]
+    for k, o in enumerate(m4bs, 1):
+        txt = _ffprobe_text(o)
+        assert "Chapter #0:0: start 0.000000" in txt
+        assert f"часть {k} из {len(m4bs)}" in txt
+        assert "media_type      : 2" in txt
+
+
+def test_cli_and_webui_iphone(tmp_path, textbook_pdf):
+    pytest.importorskip("imageio_ffmpeg")
+    import audiobook.webui as w
+    from audiobook.cli import main
+    from audiobook.pipeline import parse_into_project
+    from audiobook.project import Project
+
+    pdir = tmp_path / "projects"
+    proj = Project.create(pdir, textbook_pdf, name="Учебник")
+    parse_into_project(proj)
+    _voice_all_segments(proj)
+    main(["--projects-dir", str(pdir), "export", "Учебник", "--preset", "iphone"])
+    assert (proj.output_dir / "Учебник.m4b").exists()
+    assert Project(proj.root).settings.export.preset == "iphone"
+
+    w.S = w.AppState(str(pdir), "x", False)
+    w.S.project = Project(proj.root)
+    res = w.on_export_iphone(False, progress=lambda *a, **k: None)
+    outs, log, msg = res[:3]
+    assert outs and outs[0].endswith(".m4b") and "BookPlayer" in msg
