@@ -951,3 +951,42 @@ def test_cli_and_webui_iphone(tmp_path, textbook_pdf):
     res = w.on_export_iphone(False, progress=lambda *a, **k: None)
     outs, log, msg = res[:3]
     assert outs and outs[0].endswith(".m4b") and "BookPlayer" in msg
+
+
+def test_export_parallel_progress_and_duration(tmp_path, textbook_pdf):
+    pytest.importorskip("imageio_ffmpeg")
+    from audiobook.audio import ExportOptions, media_duration
+    from audiobook.pipeline import export_book, parse_into_project
+    from audiobook.project import Project
+
+    proj = Project.create(tmp_path / "projects", textbook_pdf, name="Учебник")
+    parse_into_project(proj)
+    _voice_all_segments(proj, seconds=2.0)
+    seen = []
+    logs = []
+    outs = export_book(
+        proj, ExportOptions(formats=("mp3", "m4b"), split_level=3), log=logs.append,
+        progress=lambda f, m: seen.append(f),
+    )
+    assert seen and seen[-1] == 1.0
+    assert all(b >= a - 1e-9 for a, b in zip(seen, seen[1:]))  # прогресс не откатывается
+    mp3s = [o for o in outs if o.endswith(".mp3")]
+    m4b = next(o for o in outs if o.endswith(".m4b"))
+    # M4B, склеенный из параллельно закодированных частей, по длительности = сумме MP3-групп
+    total = sum(media_duration(p) for p in mp3s)
+    assert abs(media_duration(m4b) - total) < 0.5
+    work = proj.output_dir / "_work"
+    assert not work.exists() or not any(work.iterdir())  # промежуточные WAV/M4A убраны
+
+
+def test_ffmpeg_watchdog(tmp_path):
+    pytest.importorskip("imageio_ffmpeg")
+    import soundfile as sf
+
+    from audiobook.audio import _run_ffmpeg_pcm
+
+    wav = tmp_path / "a.wav"
+    sf.write(str(wav), np.zeros(48000 * 5, np.float32), 48000)
+    # -re читает вход в реальном времени (5 с) — сторож с лимитом 1 с должен остановить ffmpeg
+    with pytest.raises(RuntimeError, match="не уложился"):
+        _run_ffmpeg_pcm([str(wav)], ["-af", "arealtime", "-f", "null", "-"], timeout=1.0)

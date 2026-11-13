@@ -7,9 +7,11 @@
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import subprocess
 import sys
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterable, List, Optional, Sequence, Tuple
@@ -123,7 +125,7 @@ def _run_ffmpeg(args: List[str]) -> None:
         raise RuntimeError("ffmpeg: " + proc.stderr.decode("utf-8", "replace")[-2000:])
 
 
-def _run_ffmpeg_pcm(wav_paths: Sequence[str], args: List[str]) -> None:
+def _run_ffmpeg_pcm(wav_paths: Sequence[str], args: List[str], timeout: Optional[float] = None) -> None:
     """Запускает ffmpeg, подавая звук из WAV-файлов «сырым» PCM s16le через stdin.
 
     Зачем: ffmpeg из Ubuntu (6.1) при чтении WAV ищет в PCM-данных поток S/PDIF и на некоторых
@@ -143,11 +145,19 @@ def _run_ffmpeg_pcm(wav_paths: Sequence[str], args: List[str]) -> None:
     cmd = [ff, "-hide_banner", "-loglevel", "error", "-y", "-f", "s16le", "-ar", str(sr), "-ac", "1", "-i", "pipe:0", *args]
     proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, **kwargs)
     err_chunks: List[bytes] = []
-
-    import threading
-
     t = threading.Thread(target=lambda: err_chunks.append(proc.stderr.read()), daemon=True)
     t.start()
+    # сторож: если ffmpeg действительно завис — убиваем процесс и сообщаем, а не ждём вечно
+    timed_out = threading.Event()
+
+    def _kill():
+        timed_out.set()
+        proc.kill()
+
+    watchdog = threading.Timer(timeout, _kill) if timeout else None
+    if watchdog:
+        watchdog.daemon = True
+        watchdog.start()
     try:
         for p in wav_paths:
             with sf.SoundFile(str(p)) as f:
@@ -156,13 +166,35 @@ def _run_ffmpeg_pcm(wav_paths: Sequence[str], args: List[str]) -> None:
                 for block in f.blocks(blocksize=sr * 10, dtype="int16"):
                     proc.stdin.write(np.ascontiguousarray(block).tobytes())
         proc.stdin.close()
-    except BrokenPipeError:
+    except (BrokenPipeError, OSError):
         pass
     finally:
         rc = proc.wait()
+        if watchdog:
+            watchdog.cancel()
         t.join(timeout=5)
+    if timed_out.is_set():
+        raise RuntimeError(f"ffmpeg не уложился в {timeout:.0f} с и был остановлен ({Path(str(wav_paths[0])).name})")
     if rc != 0:
         raise RuntimeError("ffmpeg: " + b"".join(err_chunks).decode("utf-8", "replace")[-2000:])
+
+
+def media_duration(path: str) -> Optional[float]:
+    """Длительность медиафайла по заголовку (ffmpeg -i). None — если не удалось прочитать."""
+    ff = find_ffmpeg()
+    if not ff:
+        return None
+    kwargs = {"creationflags": 0x08000000} if sys.platform == "win32" else {}
+    proc = subprocess.run([ff, "-hide_banner", "-i", str(path)], capture_output=True, **kwargs)
+    m = re.search(r"Duration: (\d+):(\d+):(\d+(?:\.\d+)?)", proc.stderr.decode("utf-8", "replace"))
+    if not m:
+        return None
+    return int(m.group(1)) * 3600 + int(m.group(2)) * 60 + float(m.group(3))
+
+
+def encode_timeout(duration_sec: float) -> float:
+    """Предел на кодирование одного файла: даже медленный кодер укладывается в 0.5× реального времени."""
+    return max(600.0, duration_sec * 0.5)
 
 
 def _meta_escape(s: str) -> str:
@@ -264,6 +296,7 @@ def encode_mp3(
     artist: str = "",
     track: Optional[int] = None,
     cover: Optional[str] = None,
+    timeout: Optional[float] = None,
 ) -> None:
     args = []
     if cover and os.path.exists(cover):
@@ -277,26 +310,19 @@ def encode_mp3(
             args += ["-metadata", f"{k}={v}"]
     if track is not None:
         args += ["-metadata", f"track={track}"]
-    _run_ffmpeg_pcm([wav_path], args + [out_path])
+    _run_ffmpeg_pcm([wav_path], args + [out_path], timeout=timeout)
 
 
-def build_m4b(
-    chapter_wavs: Sequence[str],
+def _write_ffmetadata(
+    path: Path,
     markers: Sequence[Tuple[str, float]],
     total_duration: float,
-    out_path: str,
-    opts: ExportOptions,
     title: str = "",
     artist: str = "",
-    cover: Optional[str] = None,
-    work_dir: Optional[str] = None,
     album: str = "",
     track: Optional[str] = None,
 ) -> None:
-    """Склеивает WAV-файлы в M4B. markers — [(название, начало_с)] от начала файла."""
-    work = Path(work_dir or Path(out_path).parent)
-    meta = work / "_chapters.txt"
-    with open(meta, "w", encoding="utf-8") as f:
+    with open(path, "w", encoding="utf-8") as f:
         f.write(";FFMETADATA1\n")
         if title:
             f.write(f"title={_meta_escape(title)}\n")
@@ -315,6 +341,75 @@ def build_m4b(
                 continue
             f.write(f"\n[CHAPTER]\nTIMEBASE=1/1000\nSTART={int(round(start * 1000))}\nEND={int(round(end * 1000))}\n")
             f.write(f"title={_meta_escape(name)}\n")
+
+
+def encode_aac(wav_path: str, out_path: str, opts: ExportOptions, timeout: Optional[float] = None) -> None:
+    """Один файл-группа (§/глава) → AAC в контейнере MP4 (.m4a). Запускается параллельно для многих групп."""
+    args = ["-map", "0:a", "-c:a", "aac", "-b:a", opts.aac_bitrate, "-ar", str(opts.sample_rate), "-ac", "1"]
+    args += ["-f", "mp4", out_path]
+    _run_ffmpeg_pcm([wav_path], args, timeout=timeout)
+
+
+def build_m4b_from_aac(
+    m4a_paths: Sequence[str],
+    markers: Sequence[Tuple[str, float]],
+    total_duration: float,
+    out_path: str,
+    title: str = "",
+    artist: str = "",
+    cover: Optional[str] = None,
+    work_dir: Optional[str] = None,
+    album: str = "",
+    track: Optional[str] = None,
+) -> None:
+    """Склейка уже закодированных .m4a в M4B БЕЗ перекодирования (-c:a copy) + метки, теги, обложка.
+
+    Даже для 36-часовой книги это секунды: вся тяжёлая работа сделана параллельно в :func:`encode_aac`.
+    """
+    work = Path(work_dir or Path(out_path).parent)
+    lst = work / "_concat.txt"
+    meta = work / "_chapters.txt"
+    with open(lst, "w", encoding="utf-8") as f:
+        for p in m4a_paths:
+            safe = str(Path(p).resolve()).replace("\\", "/").replace("'", "'\\''")
+            f.write(f"file '{safe}'\n")
+    _write_ffmetadata(meta, markers, total_duration, title, artist, album, track)
+    args = ["-f", "concat", "-safe", "0", "-i", str(lst), "-i", str(meta)]
+    has_cover = bool(cover and os.path.exists(cover))
+    if has_cover:
+        args += ["-i", cover]
+    args += ["-map", "0:a", "-map_metadata", "1", "-map_chapters", "1"]
+    if has_cover:
+        args += ["-map", "2:v", "-c:v", "mjpeg", "-disposition:v:0", "attached_pic"]
+    args += ["-c:a", "copy", "-movflags", "+faststart", "-f", "mp4", out_path]
+    try:
+        _run_ffmpeg(args)
+    finally:
+        for p in (lst, meta):
+            try:
+                p.unlink()
+            except OSError:
+                pass
+
+
+def build_m4b(
+    chapter_wavs: Sequence[str],
+    markers: Sequence[Tuple[str, float]],
+    total_duration: float,
+    out_path: str,
+    opts: ExportOptions,
+    title: str = "",
+    artist: str = "",
+    cover: Optional[str] = None,
+    work_dir: Optional[str] = None,
+    album: str = "",
+    track: Optional[str] = None,
+) -> None:
+    """Склеивает WAV-файлы в M4B одним процессом ffmpeg (медленно для длинных книг — основной путь
+    теперь :func:`build_m4b_from_aac`). markers — [(название, начало_с)] от начала файла."""
+    work = Path(work_dir or Path(out_path).parent)
+    meta = work / "_chapters.txt"
+    _write_ffmetadata(meta, markers, total_duration, title, artist, album, track)
     args = ["-i", str(meta)]
     has_cover = bool(cover and os.path.exists(cover))
     if has_cover:
