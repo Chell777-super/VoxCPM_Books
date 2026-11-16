@@ -235,7 +235,8 @@ def definition_text(par: str) -> Optional[str]:
     if not m:
         return None
     term, paren, rest = m.group(1).strip(), (m.group(2) or "").strip(), m.group(3).strip()
-    head = term
+    # «Бренд (брендинг)» → «Бренд, брендинг»: синоним в скобках в конце термина читаем через запятую
+    head = re.sub(r"\s*\(([^()]{1,60})\)\s*$", r", \1", term)
     if paren:
         o = _ORIGIN_RE.match(paren)
         if o:

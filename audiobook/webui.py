@@ -429,6 +429,36 @@ def on_lib_load(name):
     return VOICE_MODES[0], v.audio, v.transcript, v.style, name, f"Голос «{name}» загружен. Нажмите «Сохранить голос в проект»."
 
 
+def _projects_with_voice():
+    """Проекты, в которых сохранён образец голоса (кроме открытого)."""
+    cur = S.project.name if S.project else None
+    out = []
+    for name in list_projects(S.projects_dir):
+        if name == cur:
+            continue
+        try:
+            v = Project(S.projects_dir / name).settings.voice
+        except Exception:  # noqa: BLE001
+            continue
+        if v.reference_wav and os.path.exists(v.reference_wav):
+            out.append(name)
+    return out
+
+
+def on_voice_from_project(name):
+    """Тот же голос, что в другой книге (например, во втором томе — голос первого)."""
+    if not name:
+        raise gr.Error("Выберите проект, из которого взять голос.")
+    v = Project(S.projects_dir / name).settings.voice
+    if not (v.reference_wav and os.path.exists(v.reference_wav)):
+        raise gr.Error(f"В проекте «{name}» нет сохранённого образца голоса.")
+    kind = "Hi-Fi (образец + точный текст)" if (v.prompt_text or "").strip() else "образец без текста"
+    return (
+        VOICE_MODES[0], v.reference_wav, v.prompt_text or "", v.style or "",
+        f"Голос из проекта «{name}» подставлен: {kind}. Нажмите «Сохранить голос в проект».",
+    )
+
+
 def on_use_design(sample_path, sample_text):
     p = _need_project()
     if not sample_path:
@@ -720,6 +750,14 @@ def build_ui() -> gr.Blocks:
                         lib_dd = gr.Dropdown(label="📚 Библиотека голосов", choices=list_voices(S.voices_dir), scale=3)
                         lib_load_btn = gr.Button("Взять", scale=1)
                         lib_refresh_btn = gr.Button("🔄", scale=0, min_width=50)
+                    with gr.Row():
+                        vp_dd = gr.Dropdown(
+                            label="📖 Голос из другой книги (например, из первого тома)",
+                            choices=_projects_with_voice(),
+                            scale=3,
+                        )
+                        vp_load_btn = gr.Button("Взять", scale=1)
+                        vp_refresh_btn = gr.Button("🔄", scale=0, min_width=50)
                     ref_audio = gr.Audio(label="Образец голоса", type="filepath", sources=["upload", "microphone"])
                     ref_info = gr.Markdown()
                     ref_text = gr.Textbox(
@@ -829,6 +867,8 @@ def build_ui() -> gr.Blocks:
         lib_save_btn.click(on_lib_save, inputs=[lib_name, ref_audio, ref_text, style], outputs=[lib_msg, lib_dd])
         lib_load_btn.click(on_lib_load, inputs=lib_dd, outputs=[voice_mode, ref_audio, ref_text, style, lib_name, lib_msg])
         lib_refresh_btn.click(lambda: gr.update(choices=list_voices(S.voices_dir)), outputs=lib_dd)
+        vp_load_btn.click(on_voice_from_project, inputs=vp_dd, outputs=[voice_mode, ref_audio, ref_text, style, lib_msg])
+        vp_refresh_btn.click(lambda: gr.update(choices=_projects_with_voice()), outputs=vp_dd)
         save_voice_btn.click(on_save_voice, inputs=voice_inputs, outputs=[voice_msg, status_md])
         test_btn.click(on_test_voice, inputs=[test_text] + voice_inputs, outputs=[test_audio, test_msg])
         design_btn.click(on_design_sample, inputs=[design_desc, design_text, cfg, preset, seed], outputs=[design_audio, design_msg])

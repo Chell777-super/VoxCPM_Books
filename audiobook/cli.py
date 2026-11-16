@@ -69,6 +69,15 @@ def _apply_voice_args(proj: Project, a) -> bool:
     """Возвращает True, если голос изменился."""
     v = proj.settings.voice
     before = (v.mode, v.reference_wav, v.prompt_text, v.style)
+    if getattr(a, "voice_from", None):  # тот же голос, что в другом проекте (том 1 → том 2)
+        src = _open_project(a.voice_from, a.projects_dir).settings.voice
+        if not (src.reference_wav and os.path.exists(src.reference_wav)):
+            sys.exit(f"В проекте «{a.voice_from}» нет сохранённого образца голоса")
+        a.ref = src.reference_wav
+        if getattr(a, "ref_text", None) is None:
+            a.ref_text = src.prompt_text or ""
+        if getattr(a, "style", None) is None and src.style:
+            a.style = src.style
     if getattr(a, "voice", None):  # голос из библиотеки
         from .voices import load_voice
 
@@ -297,6 +306,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     def voice_opts(p):
         p.add_argument("--voice", help="голос из библиотеки (см. команду voices)")
+        p.add_argument("--voice-from", help="взять голос из другого проекта (например, из первого тома)")
         p.add_argument("--ref", help="образец голоса (wav/mp3/flac), 10–20 с")
         p.add_argument("--ref-text", help="точный текст образца → максимальная похожесть")
         p.add_argument("--style", help="инструкция стиля, напр. «спокойно, размеренно»")

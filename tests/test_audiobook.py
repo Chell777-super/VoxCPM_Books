@@ -990,3 +990,79 @@ def test_ffmpeg_watchdog(tmp_path):
     # -re читает вход в реальном времени (5 с) — сторож с лимитом 1 с должен остановить ffmpeg
     with pytest.raises(RuntimeError, match="не уложился"):
         _run_ffmpeg_pcm([str(wav)], ["-af", "arealtime", "-f", "null", "-"], timeout=1.0)
+
+
+# --------------------------------------------------------------------------- #
+# Второй том: термины со скобками, «от англ.», голос из другого проекта
+# --------------------------------------------------------------------------- #
+
+
+def test_definitions_with_parentheses_and_origin():
+    from audiobook.segmenter import definition_text
+
+    t = normalize_text(definition_text("**Бренд (брендинг)** — клеймо; марочный (от англ. brand — марка товара); принцип."))
+    assert t.startswith("Бренд, брендинг. Клеймо; марочный")
+    assert "от английского brand" in t and "от от" not in t
+    t = normalize_text(definition_text("**Горизонтальные сбытовые (маркетинговые) сети** — система организаций."))
+    assert t.endswith("сети. Система организаций.")
+    assert normalize_text("Слово (от лат. commercium) и (англ. market).").count("от ") == 2
+
+
+@pytest.mark.parametrize(
+    "line,is_toc",
+    [
+        ("Глава 1. Правовое регулирование товарных рынков ........................ 15", True),
+        ("§ 1. Товарный рынок и предприниматель .............................................", True),
+        ("в России..........................................................................................", True),
+        ("Список сокращений ……………………………………", True),
+        ("Глава 2. Правовое регулирование организации", False),
+        ("Обычное предложение. Потом ещё одно...", False),
+    ],
+)
+def test_toc_leader_lines(line, is_toc):
+    from audiobook.pdf_extract import TOC_LEADER_RE
+
+    assert bool(TOC_LEADER_RE.search(line)) is is_toc
+
+
+def test_voice_from_other_project(tmp_path, textbook_pdf):
+    import soundfile as sf
+
+    import audiobook.webui as w
+    from audiobook.cli import _apply_voice_args
+    from audiobook.pipeline import parse_into_project
+    from audiobook.project import Project
+
+    pdir = tmp_path / "projects"
+    ref = tmp_path / "ref.wav"
+    sf.write(str(ref), (0.1 * np.sin(np.arange(16000 * 6) / 16000 * 2 * np.pi * 150)).astype(np.float32), 16000)
+
+    class A:  # аргументы CLI
+        projects_dir = str(pdir)
+        voices_dir = str(tmp_path / "voices")
+
+    vol1 = Project.create(pdir, textbook_pdf, name="Том 1")
+    parse_into_project(vol1)
+    a = A()
+    a.ref, a.ref_text = str(ref), "Точный текст образца."
+    _apply_voice_args(vol1, a)
+    assert vol1.settings.voice.mode == "clone"
+
+    vol2 = Project.create(pdir, textbook_pdf, name="Том 2")
+    parse_into_project(vol2)
+    # CLI: --voice-from
+    b = A()
+    b.voice_from = "Том 1"
+    _apply_voice_args(vol2, b)
+    v2 = vol2.settings.voice
+    assert v2.mode == "clone" and v2.prompt_text == "Точный текст образца."
+    assert os.path.exists(v2.reference_wav) and str(vol2.root) in v2.reference_wav  # образец скопирован в свой проект
+    # одинаковый голос → одинаковая «подпись» (тот же тембр в обоих томах)
+    assert vol1.voice_signature() == vol2.voice_signature()
+
+    # веб-интерфейс
+    w.S = w.AppState(str(pdir), "x", False)
+    w.S.project = Project(vol2.root)
+    assert w._projects_with_voice() == ["Том 1"]
+    mode, audio, text, style, msg = w.on_voice_from_project("Том 1")
+    assert mode == w.VOICE_MODES[0] and text == "Точный текст образца." and "Hi-Fi" in msg
