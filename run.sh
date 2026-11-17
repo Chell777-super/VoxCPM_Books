@@ -14,7 +14,7 @@ export VOXBOOKS_BACKEND="${VOXBOOKS_BACKEND:-auto}"
 # если команда не указана (только опции вроде --concurrency 24) — запускаем веб-интерфейс
 has_cmd=0
 for a in "$@"; do
-  case "$a" in ui|new|text|synth|export|make|status|pdf2text|voice-add|voices|-h|--help) has_cmd=1 ;; esac
+  case "$a" in ui|new|text|script|synth|export|make|status|pdf2text|voice-add|voices|-h|--help) has_cmd=1 ;; esac
 done
 [ "$has_cmd" = 1 ] || set -- "$@" ui
 exec .venv/bin/python -m audiobook "$@"

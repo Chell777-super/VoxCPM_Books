@@ -338,9 +338,7 @@ class TTSEngine:
         style = (v.style or "").strip() if v else ""
         # В режиме продолжения (с транскриптом) инструкция стиля игнорируется моделью
         in_continuation = bool(self.prompt_cache and self.prompt_cache.get("mode") in ("continuation", "ref_continuation"))
-        if style and not in_continuation:
-            return f"({style}){text}"
-        return text
+        return apply_style(text, style, in_continuation)
 
     # ----------------------------------------------------------------- synth
     def synthesize(self, text: str, sc: SynthConfig, seed: Optional[int] = None, expected_cps: Optional[float] = None) -> SynthResult:
@@ -397,16 +395,38 @@ class TTSEngine:
             return str(e)
 
 
+def apply_style(text: str, style: str, hifi: bool) -> str:
+    """Инструкция модели для фрагмента.
+
+    Если фрагмент уже начинается с «(…)» (режим «Сценарий»: стиль части/строки) — глобальный стиль не
+    добавляем. В Hi-Fi режиме (продолжение образца) модель инструкции игнорирует и может прочитать
+    их вслух — тогда убираем совсем.
+    """
+    from .script import split_instruction
+
+    own, rest = split_instruction(text)
+    if hifi:
+        return rest if own else text
+    if own:
+        return text
+    return f"({style}){text}" if style else text
+
+
 def evaluate_take(text: str, wav: np.ndarray, sr: int, sc: "SynthConfig", expected_cps: Optional[float]) -> tuple:
     """Контроль качества дубля по темпу речи: (ok, симв./с, заметка)."""
+    from .script import TAG_RE, spoken_text
+
+    has_tags = bool(TAG_RE.search(text))
+    text = spoken_text(text)  # без инструкции «(…)» и тегов [laughing]
     n_chars = max(1, len(text))
     cps = n_chars / max(speech_seconds(wav, sr), 0.05)
-    ok = sc.min_cps <= cps <= sc.max_cps
+    min_cps = sc.min_cps * (0.5 if has_tags else 1.0)  # смех/вздох занимают время без текста
+    ok = min_cps <= cps <= sc.max_cps
     note = ""
     if not ok:
-        note = "слишком медленно/лишнее" if cps < sc.min_cps else "слишком быстро/обрыв"
+        note = "слишком медленно/лишнее" if cps < min_cps else "слишком быстро/обрыв"
     # Если знаем типичную скорость диктора — проверяем отклонение строже
-    if ok and expected_cps and n_chars >= 40:
+    if ok and expected_cps and n_chars >= 40 and not has_tags:
         ratio = cps / expected_cps
         if ratio < 0.55 or ratio > 1.8:
             ok, note = False, f"темп ×{ratio:.2f} от среднего"
@@ -422,8 +442,11 @@ def pick_better(best: Optional["SynthResult"], res: "SynthResult", expected_cps:
 
 
 def max_patches_for(text: str) -> int:
-    """Предел длины генерации (патчи 6.25/с): с запасом под самый медленный допустимый темп."""
-    return int(len(text) * 1.3 + 40)
+    """Предел длины генерации (патчи 6.25/с): с запасом под самый медленный допустимый темп
+    (+ ~2 с на каждый тег смеха/вздоха)."""
+    from .script import TAG_RE, spoken_text
+
+    return int(len(spoken_text(text)) * 1.3 + 40 + 12 * len(TAG_RE.findall(text)))
 
 
 def speech_seconds(wav: np.ndarray, sr: int, rel_db: float = -40.0) -> float:

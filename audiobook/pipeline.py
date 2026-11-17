@@ -51,6 +51,15 @@ def parse_into_project(project: Project, book: Optional[Book] = None, log: LogFn
     """Извлекает текст (если book не передан) и разбивает на сегменты."""
     st = project.settings
     report = None
+    if st.mode == "script":
+        from .script import segment_script
+
+        if not project.script_path.exists():
+            raise FileNotFoundError("В проекте нет script.txt")
+        book, segs = segment_script(project.script_path.read_text(encoding="utf-8"), st.script, st.normalize)
+        book.title = project.name
+        project.set_segments(book, segs)
+        return project.stats()
     if book is None:
         src = project.source_file
         if src is None:

@@ -1066,3 +1066,117 @@ def test_voice_from_other_project(tmp_path, textbook_pdf):
     assert w._projects_with_voice() == ["Том 1"]
     mode, audio, text, style, msg = w.on_voice_from_project("Том 1")
     assert mode == w.VOICE_MODES[0] and text == "Точный текст образца." and "Hi-Fi" in msg
+
+
+# --------------------------------------------------------------------------- #
+# Режим «Сценарий»: речь/монолог с ремарками, смехом, паузами и стилем частей
+# --------------------------------------------------------------------------- #
+
+MONOLOG = """Пояснение автора — не читается.
+
+---
+
+**[Интро]** *(0:00–0:13, играют одни струнные)*
+
+Счастливый человек… А кто сейчас счастливый? Покажите мне его.
+Друзья были. Пока я был нужен.
+
+*(≈0:13, вступает бас)*
+
+Жалею ли я о чём-то? Жалею.
+
+**[Монолог]**
+
+Хорошее было? Было. Один раз. В девяносто каком-то… Не помню уже *(смеётся)*.
+А мечта — это как автобус ночью. И пустой! *(ха-ха-ха)*
+Сто! А позвонить в три часа ночи некому.
+Некому!
+
+**[Аутро]** {soft, tender, slow} *(на последнем затухающем аккорде)*
+
+*(пауза 2 с)*
+…Мне бы домик. Маленький. Чтобы печка трещала…
+*(шёпотом)* Тишины хочется.
+
+---
+
+Перед аутро пауза — эта заметка тоже не читается.
+"""
+
+
+def test_script_parsing():
+    from audiobook.script import segment_script
+
+    book, segs = segment_script(MONOLOG)
+    texts = [s.text for s in segs]
+    joined = " ".join(texts)
+    assert [c.title for c in book.chapters] == ["Интро", "Монолог", "Аутро"]
+    # пояснения, названия частей и ремарки не читаются
+    for bad in ("Пояснение", "заметка", "Интро", "струнные", "вступает бас", "0:13", "аккорде", "пауза", "*", "**"):
+        assert bad not in joined, bad
+    # смех — тег модели после конца фразы
+    assert "Не помню уже. [laughing]" in joined
+    assert "И пустой! [laughing]" in joined
+    # короткая «Некому!» приклеена к соседней строке
+    assert any(t.endswith("некому. Некому!") for t in texts)
+    # стиль части и стиль строки — инструкция модели в начале фрагмента
+    outro = [s for s in segs if s.chapter == 2]
+    assert outro[0].text.startswith("(soft, tender, slow)…Мне бы домик.")
+    assert outro[1].text.startswith("(whispering)Тишины хочется.")
+    # паузы: перед частью ≥ 1.5 с, явная «пауза 2 с» перед аутро, между строками 0.45 с
+    last_monolog = [s for s in segs if s.chapter == 1][-1]
+    assert last_monolog.pause_ms == 2000
+    assert segs[0].pause_ms == 450
+    first_intro_para_end = [s for s in segs if s.chapter == 0]
+    assert first_intro_para_end[1].pause_ms == 900  # пустая строка перед «Жалею ли я…»
+    assert first_intro_para_end[-1].pause_ms == 1500  # конец части
+
+
+def test_script_style_and_qc_helpers():
+    from audiobook.engine import SynthConfig, apply_style, evaluate_take, max_patches_for
+    from audiobook.script import spoken_text
+
+    assert apply_style("(soft)Текст", "global", hifi=False) == "(soft)Текст"  # свой стиль не перебиваем
+    assert apply_style("(soft)Текст", "global", hifi=True) == "Текст"  # Hi-Fi: инструкцию убираем
+    assert apply_style("Текст", "global", hifi=False) == "(global)Текст"
+    assert apply_style("Текст", "global", hifi=True) == "Текст"
+    assert spoken_text("(soft)Не помню уже. [laughing]") == "Не помню уже."
+    assert max_patches_for("Текст [laughing]") > max_patches_for("Текст")
+    # смех удлиняет фрагмент — это не «заговорился»
+    sr = 48000
+    wav = np.full(int(sr * 3.0), 0.1, np.float32)
+    ok, cps, _ = evaluate_take("(soft)Не помню уже. [laughing]", wav, sr, SynthConfig(), expected_cps=14.0)
+    assert ok, cps
+
+
+def test_script_project_and_export(tmp_path):
+    pytest.importorskip("imageio_ffmpeg")
+    import audiobook.webui as w
+    from audiobook.pipeline import export_book, parse_into_project
+    from audiobook.project import Project
+
+    pdir = tmp_path / "projects"
+    w.S = w.AppState(str(pdir), "x", False)
+    sopts = [0.45, 0.9, 1.5, 12, False, "Настоящий смех"]
+    summary, preview = w.on_script_preview(MONOLOG, *sopts)
+    assert "Частей: 3" in summary and "[laughing]" in preview
+    out = w.on_script_create(MONOLOG, "Монолог", *sopts)
+    assert "создан" in out[0]
+    p = Project(pdir / "Монолог")
+    assert p.settings.mode == "script" and p.script_path.exists()
+    n1 = len(p.segments)
+    # повторное создание — обновление; неизменённые реплики сохраняют ключи
+    keys = {s.key for s in p.segments}
+    w.on_script_create(MONOLOG.replace("Жалею.", "Жалею, конечно."), "Монолог", *sopts)
+    p = Project(pdir / "Монолог")
+    assert len(p.segments) == n1 and len(keys & {s.key for s in p.segments}) == n1 - 1
+    # озвучиваем тоном и собираем — один трек
+    _voice_all_segments(p)
+    w.S.project = p
+    outs, log, msg = w.on_export(
+        ["MP3 (отдельные файлы)", "WAV (отдельные файлы)"], "Параграфам (§)", "Параграфам (§)", "320k", "256k", "48000",
+        True, False, 0, progress=lambda *a, **k: None,
+    )
+    assert len([o for o in outs if o.endswith(".mp3")]) == 1 and len([o for o in outs if o.endswith(".wav")]) == 1
+    # открытие проекта подставляет текст сценария во вкладку
+    assert w.on_open("Монолог")[-1].startswith("Пояснение автора")

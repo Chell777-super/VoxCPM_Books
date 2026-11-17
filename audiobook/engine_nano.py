@@ -35,6 +35,7 @@ from .engine import (
     SynthResult,
     VoiceConfig,
     _resolve_model_dir,
+    apply_style,
     evaluate_take,
     max_patches_for,
     pick_better,
@@ -167,9 +168,7 @@ class NanoEngine:
 
     def _full_text(self, text: str) -> str:
         style = (self.voice.style or "").strip() if self.voice else ""
-        if style and not self._prompt_latents:
-            return f"({style}){text}"
-        return text
+        return apply_style(text, style, hifi=bool(self._prompt_latents))
 
     # ----------------------------------------------------------------- synth
     async def _generate(self, text: str, sc: SynthConfig, seed: int) -> np.ndarray:

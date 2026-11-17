@@ -271,6 +271,39 @@ def cmd_pdf2text(a):
             print("⚠ " + w)
 
 
+def cmd_script(a):
+    """Сценарий (речь, монолог) → проект; печатает, как его прочитает модель."""
+    from .script import ScriptOptions, segment_script
+    from .textproc import render_speech
+
+    text = Path(a.file).read_text(encoding="utf-8")
+    opts = ScriptOptions(
+        pause_line_ms=int(a.pause_line * 1000),
+        pause_paragraph_ms=int(a.pause_paragraph * 1000),
+        pause_section_ms=int(a.pause_section * 1000),
+        read_section_titles=a.read_titles,
+        laughter=a.laughter,
+    )
+    book, segs = segment_script(text, opts)
+    print(render_speech(book, segs))
+    if a.preview:
+        return
+    name = a.name or Path(a.file).stem
+    root = Path(a.projects_dir) / name
+    if (root / "project.json").exists():
+        proj = Project(root)
+        if proj.settings.mode != "script":
+            sys.exit(f"Проект «{name}» — книга, а не сценарий")
+        proj.script_path.write_text(text, encoding="utf-8")
+    else:
+        proj = Project.create_script(a.projects_dir, name, text)
+    proj.settings.script = opts
+    proj.save()
+    parse_into_project(proj)
+    _print_stats(proj)
+    print(f"Дальше: synth {proj.name} --voice … ; export {proj.name}")
+
+
 def cmd_ui(a):
     from .webui import launch
 
@@ -358,6 +391,17 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("status", help="состояние проекта")
     p.add_argument("project")
     p.set_defaults(func=cmd_status)
+
+    p = sub.add_parser("script", help="сценарий/монолог → проект (ремарки, смех, паузы, стиль частей)")
+    p.add_argument("file")
+    p.add_argument("--name")
+    p.add_argument("--preview", action="store_true", help="только показать, как прочитает модель")
+    p.add_argument("--pause-line", type=float, default=0.45, help="пауза между строками, с")
+    p.add_argument("--pause-paragraph", type=float, default=0.9, help="пауза на пустой строке, с")
+    p.add_argument("--pause-section", type=float, default=1.5, help="пауза между частями, с")
+    p.add_argument("--read-titles", action="store_true", help="читать названия частей")
+    p.add_argument("--laughter", choices=["tag", "skip", "text"], default="tag")
+    p.set_defaults(func=cmd_script)
 
     p = sub.add_parser("pdf2text", help="PDF → размеченный текст и предпросмотр озвучки (без модели)")
     p.add_argument("files", nargs="+")

@@ -299,7 +299,99 @@ def on_open(name):
         raise gr.Error("Выберите проект")
     S.project = Project(S.projects_dir / name)
     out = list(_parse_outputs(f"Открыт проект «{name}»."))
-    return out + list(_voice_ui_values()) + _parse_ui_values()
+    script = S.project.script_path.read_text(encoding="utf-8") if S.project.settings.mode == "script" and S.project.script_path.exists() else gr.update()
+    return out + list(_voice_ui_values()) + _parse_ui_values() + [script]
+
+
+SCRIPT_HELP = """**Как размечать сценарий** (твой текст в Markdown подходит как есть):
+
+| Пишешь | Что будет |
+|---|---|
+| текст до первой `---` и после последней | пояснения — **не читаются** |
+| `**[Интро]**`, `**[Речь]**` | начало части — название не читается, перед частью пауза |
+| `**[Аутро]** {тихо, нежно, медленно}` | стиль всей части (инструкция модели; лучше по-английски: `{soft, tender, slow}`) |
+| `*(0:00–0:13, играют струнные)*` | ремарка — **не читается** |
+| `*(смеётся)*`, `*(ха-ха-ха)*` | настоящий смех (`[laughing]`) |
+| `*(вздыхает)*` | вздох (`[sigh]`) |
+| `*(пауза 2 с)*` | тишина нужной длины |
+| `*(тихо)* Текст…` / `*(с иронией)*` / `*(шёпотом)*` | стиль одной строки |
+| каждая строка | отдельная реплика с короткой паузой; пустая строка — пауза длиннее |
+| `// комментарий` | не читается |
+
+⚠ Стиль (`{…}` и `*(тихо)*`) работает при клонировании **без** текста образца и в дизайне голоса.
+В Hi-Fi режиме (образец + точный текст) модель инструкции игнорирует — они просто не передаются.
+"""
+
+
+def _script_opts(pause_line, pause_para, pause_section, min_chars, read_titles, laughter):
+    from .script import ScriptOptions
+
+    return ScriptOptions(
+        pause_line_ms=int(pause_line * 1000),
+        pause_paragraph_ms=int(pause_para * 1000),
+        pause_section_ms=int(pause_section * 1000),
+        min_line_chars=int(min_chars),
+        read_section_titles=bool(read_titles),
+        laughter={"Настоящий смех": "tag", "Пропускать": "skip", "Читать как текст": "text"}.get(laughter, "tag"),
+    )
+
+
+def _script_warnings(segs) -> str:
+    from .script import split_instruction
+
+    styled = sum(1 for x in segs if split_instruction(x.text)[0])
+    warn = []
+    if styled and S.project is not None and S.project.settings.voice.mode == "clone" and (S.project.settings.voice.prompt_text or "").strip():
+        warn.append(
+            f"⚠ В сценарии {styled} фрагм. со стилем, а голос открытого проекта — Hi-Fi (с текстом образца): "
+            "стиль будет проигнорирован. Для стилей уберите текст образца во вкладке «Голос»."
+        )
+    return "\n".join(warn)
+
+
+def on_script_preview(text, *sopts):
+    from .script import segment_script
+    from .textproc import render_speech
+
+    if not (text or "").strip():
+        raise gr.Error("Вставьте текст сценария.")
+    book, segs = segment_script(text, _script_opts(*sopts))
+    if not segs:
+        raise gr.Error("Нечего озвучивать: проверьте разметку (текст между «---», части «**[Название]**»).")
+    chars = sum(len(x.text) for x in segs)
+    pauses = sum(x.pause_ms for x in segs) / 1000
+    summary = (
+        f"Частей: {len(book.chapters)} · фрагментов: {len(segs)} · {chars} симв. · "
+        f"≈ {fmt_duration(estimate_duration_sec(chars) + pauses)} с паузами"
+    )
+    w = _script_warnings(segs)
+    return summary + ("  \n" + w if w else ""), render_speech(book, segs)
+
+
+def on_script_create(text, name, *sopts):
+    if S.busy:
+        raise gr.Error("Идёт озвучка — сначала остановите её.")
+    if not (text or "").strip():
+        raise gr.Error("Вставьте текст сценария.")
+    name = (name or "").strip() or "Сценарий"
+    root = S.projects_dir / safe_filename(name)
+    if (root / "project.json").exists():
+        p = Project(root)
+        if p.settings.mode != "script":
+            raise gr.Error(f"Проект «{p.name}» — книга, а не сценарий. Выберите другое название.")
+        p.script_path.write_text(text, encoding="utf-8")
+        verb = "обновлён (неизменённые реплики не переозвучиваются)"
+    else:
+        p = Project.create_script(S.projects_dir, name, text)
+        verb = "создан"
+    p.settings.script = _script_opts(*sopts)
+    p.save()
+    S.project = p
+    info = parse_into_project(p, log=S._log)
+    return _parse_outputs(
+        f"✅ Сценарий «{p.name}» {verb}: частей {info['chapters']}, фрагментов {info['total']}. "
+        "Дальше — «Голос» → «Озвучка» → «Сборка» (получится один трек MP3 + WAV)."
+    )
 
 
 def _parse_ui_values():
@@ -638,6 +730,10 @@ def on_export(formats, split_by, marks_by, mp3_br, aac_br, sr, folders, allow_mi
         folders=bool(folders),
         max_part_mb=int(max_part_mb or 0),
     )
+    if p.settings.mode == "script":  # речь/монолог — один трек, части — метками
+        p.settings.export.split_level = 1
+        p.settings.export.marker_level = 2
+        p.settings.export.folders = False
     p.save()
     logs = []
     outs = export_book(p, allow_missing=bool(allow_missing), log=logs.append, progress=lambda f, m: progress(f, desc=m))
@@ -711,6 +807,38 @@ def build_ui() -> gr.Blocks:
                         tp_refresh_btn = gr.Button("↻ Обновить предпросмотр по правленому тексту")
                     with gr.Tab("Как прочитает модель"):
                         tp_speech = gr.Textbox(lines=28, max_lines=40, show_label=False, interactive=False)
+
+        # ------------------------------------------------------------ Сценарий
+        with gr.Tab("🎭 Сценарий"):
+            gr.Markdown(
+                "Речь, монолог, стендап: части `**[Интро]**`, ремарки `*(…)*` не читаются, `*(смеётся)*` — "
+                "настоящий смех, `*(пауза 2 с)*` — тишина, `{тихо, нежно}` — настроение части. "
+                "На выходе — один трек (MP3 + WAV)."
+            )
+            with gr.Row():
+                with gr.Column(scale=2):
+                    sc_text = gr.Textbox(
+                        label="Текст сценария",
+                        lines=24,
+                        max_lines=60,
+                        placeholder="Пояснения (не читаются)\n---\n**[Интро]** *(играют струнные)*\nСчастливый человек… А кто сейчас счастливый?\n\n**[Аутро]** {soft, tender, slow}\n…Мне бы домик. Маленький.\n---",
+                    )
+                with gr.Column(scale=1):
+                    with gr.Accordion("Как размечать", open=False):
+                        gr.Markdown(SCRIPT_HELP)
+                    sc_pause_line = gr.Slider(0.1, 2.0, value=0.45, step=0.05, label="Пауза между строками, с")
+                    sc_pause_para = gr.Slider(0.2, 3.0, value=0.9, step=0.1, label="Пауза на пустой строке, с")
+                    sc_pause_section = gr.Slider(0.5, 5.0, value=1.5, step=0.1, label="Пауза между частями, с")
+                    sc_min = gr.Slider(0, 40, value=12, step=1, label="Короче N симв. — приклеивать к соседней строке")
+                    sc_titles = gr.Checkbox(label="Читать названия частей", value=False)
+                    sc_laugh = gr.Radio(
+                        label="Смех *(ха-ха)*", choices=["Настоящий смех", "Пропускать", "Читать как текст"], value="Настоящий смех"
+                    )
+                    sc_preview_btn = gr.Button("🔎 Как прочитает модель")
+                    sc_name = gr.Textbox(label="Название проекта", value="Монолог")
+                    sc_create_btn = gr.Button("📥 Создать / обновить проект", variant="primary")
+            sc_summary = gr.Markdown()
+            sc_preview = gr.Textbox(label="Как прочитает модель", lines=18, max_lines=40, interactive=False)
 
         # ------------------------------------------------------------ Книга
         with gr.Tab("1 · Книга"):
@@ -857,7 +985,10 @@ def build_ui() -> gr.Blocks:
         tp_btn.click(on_text_process, inputs=[tp_file] + parse_settings, outputs=[tp_summary, tp_markup, tp_speech, tp_files])
         tp_refresh_btn.click(on_text_refresh, inputs=[tp_markup, tp_file] + parse_settings, outputs=[tp_summary, tp_speech, tp_files])
         tp_create_btn.click(on_text_create_project, inputs=[tp_markup, tp_file, tp_name] + parse_settings, outputs=parse_out)
-        open_btn.click(on_open, inputs=proj_dd, outputs=parse_out + voice_inputs + parse_settings)
+        sc_opts = [sc_pause_line, sc_pause_para, sc_pause_section, sc_min, sc_titles, sc_laugh]
+        sc_preview_btn.click(on_script_preview, inputs=[sc_text] + sc_opts, outputs=[sc_summary, sc_preview])
+        sc_create_btn.click(on_script_create, inputs=[sc_text, sc_name] + sc_opts, outputs=parse_out)
+        open_btn.click(on_open, inputs=proj_dd, outputs=parse_out + voice_inputs + parse_settings + [sc_text])
         create_btn.click(on_create, inputs=[file_in, name_in] + parse_settings, outputs=parse_out)
         reparse_btn.click(on_resegment, inputs=parse_settings, outputs=parse_out)
         reextract_btn.click(on_reextract, inputs=parse_settings, outputs=parse_out)
@@ -903,9 +1034,9 @@ def build_ui() -> gr.Blocks:
                     return on_open(name)
                 except Exception:
                     pass
-            return [gr.update()] * (len(parse_out) + len(voice_inputs) + len(parse_settings))
+            return [gr.update()] * (len(parse_out) + len(voice_inputs) + len(parse_settings) + 1)
 
-        demo.load(_autoload, inputs=proj_dd, outputs=parse_out + voice_inputs + parse_settings)
+        demo.load(_autoload, inputs=proj_dd, outputs=parse_out + voice_inputs + parse_settings + [sc_text])
 
         timer = gr.Timer(2.0)
         timer.tick(on_tick, outputs=[progress_html, log_box, status_md])

@@ -33,6 +33,7 @@ from .book import Book, safe_filename
 from .engine import SynthConfig, VoiceConfig
 from .normalize import NormalizeOptions
 from .pdf_extract import ExtractOptions
+from .script import ScriptOptions
 from .segmenter import Segment, SegmentOptions
 
 
@@ -55,9 +56,13 @@ class ProjectSettings:
     voice: VoiceConfig = field(default_factory=VoiceConfig)
     synth: SynthConfig = field(default_factory=SynthConfig)
     export: ExportOptions = field(default_factory=ExportOptions)
+    script: ScriptOptions = field(default_factory=ScriptOptions)
+    mode: str = "book"  # book — книга из PDF/TXT; script — сценарий/монолог (см. audiobook/script.py)
 
     def to_dict(self) -> dict:
-        return {k: asdict(getattr(self, k)) for k in ("extract", "normalize", "segment", "voice", "synth", "export")}
+        d = {k: asdict(getattr(self, k)) for k in ("extract", "normalize", "segment", "voice", "synth", "export", "script")}
+        d["mode"] = self.mode
+        return d
 
     @classmethod
     def from_dict(cls, d: dict) -> "ProjectSettings":
@@ -68,6 +73,8 @@ class ProjectSettings:
             voice=_dc_from_dict(VoiceConfig, d.get("voice")),
             synth=_dc_from_dict(SynthConfig, d.get("synth")),
             export=_dc_from_dict(ExportOptions, d.get("export")),
+            script=_dc_from_dict(ScriptOptions, d.get("script")),
+            mode=d.get("mode", "book"),
         )
 
 
@@ -143,6 +150,23 @@ class Project:
         dst = p.root / ("source" + Path(source_file).suffix.lower())
         if Path(source_file).resolve() != dst.resolve():
             shutil.copyfile(source_file, dst)
+        p.save()
+        return p
+
+    @property
+    def script_path(self) -> Path:
+        return self.root / "script.txt"
+
+    @classmethod
+    def create_script(cls, projects_dir: str | Path, name: str, script_text: str) -> "Project":
+        """Проект-сценарий (речь, монолог): исходник — script.txt, звук — одним файлом."""
+        root = Path(projects_dir) / safe_filename(name or "Сценарий")
+        p = cls(root)
+        for d in (p.root, p.audio_dir, p.output_dir, p.voice_dir):
+            d.mkdir(parents=True, exist_ok=True)
+        p.settings.mode = "script"
+        p.settings.export = ExportOptions(formats=("mp3", "wav"), split_level=1, marker_level=2, folders=False)
+        _atomic_write(p.script_path, script_text)
         p.save()
         return p
 
