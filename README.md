@@ -1,3 +1,5 @@
+> 📚 **VoxCPM Books** — приложение для создания аудиокниг из PDF (Windows, `install.bat` на uv): см. [README_BOOKS.md](README_BOOKS.md)
+
 <h2 align="center">VoxCPM2: Tokenizer-Free TTS for Multilingual Speech Generation, Creative Voice Design, and True-to-Life Cloning</h2>
 
 <p align="center">
